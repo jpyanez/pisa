@@ -14,6 +14,7 @@ import numpy as np
 from pisa import ureg
 from pisa.core.binning import MultiDimBinning, OneDimBinning
 from pisa.core.distribution_maker import DistributionMaker
+from pisa.core.pipeline import Pipeline
 from pisa.core.param import Param, ParamSet
 from pisa.utils.binned_response import (
     expand_factorised_response, load_response_file, make_toy_response,
@@ -22,7 +23,8 @@ from pisa.utils.binned_response import (
 from pisa.utils.log import Levels, logging, set_verbosity
 
 __all__ = ['TRUE_BINNING', 'RECO_BINNING', 'CHANNELS', 'test_binned_pipeline',
-           'test_binned_pipeline_astro', 'test_astro_adds_to_weights']
+           'test_binned_pipeline_astro', 'test_astro_adds_to_weights',
+           'test_binned_pipeline_atmospheric']
 
 __author__ = 'J. P. Yanez'
 
@@ -123,7 +125,7 @@ def expected_counts(response_file, astro=None):
     ----------
     response_file : str
     astro : dict or None
-        As in `make_test_config`. Without it the flux is 1 per GeV cm^2 s sr.
+        As in `make_test_config`. Without it the flux is 1 per GeV m^2 s sr.
 
     Returns
     -------
@@ -137,18 +139,18 @@ def expected_counts(response_file, astro=None):
     widths_cz = TRUE_BINNING['true_coszen'].bin_widths.m
     volume = widths_e[:, None] * 2 * np.pi * widths_cz[None, :]
 
-    # Flux per neutrino type, GeV^-1 cm^-2 s^-1 sr^-1, evaluated at bin centres
+    # Flux per neutrino type, GeV^-1 m^-2 s^-1 sr^-1 (PISA convention), at bin centres
     flux = np.ones(TRUE_BINNING.shape)
     if astro is not None:
         e_centres = TRUE_BINNING['true_energy'].weighted_centers.m_as('GeV')
-        astro_1d = (astro['astro_norm'] * 0.787e-18
+        astro_1d = (astro['astro_norm'] * 0.787e-14
                     * (e_centres / 1e5) ** (-2.5 + astro['astro_delta']))
         astro_flux = np.repeat(astro_1d[:, None], TRUE_BINNING.shape[1], axis=1)
         flux = astro_flux if astro['astro_only'] else flux + astro_flux
 
     total = np.zeros(RECO_BINNING.shape)
     for name in CHANNELS:
-        counts_true = volume * flux * loaded['aeff'][name] * 1e4 * LIVETIME.m_as('s')
+        counts_true = volume * flux * loaded['aeff'][name] * LIVETIME.m_as('s')
         # Sum over the true axes of counts_true[e, z] * R[e, z, ...]
         total += np.tensordot(counts_true, loaded['response'][name], axes=2)
     return total
@@ -240,7 +242,7 @@ def test_astro_adds_to_weights(verbosity=Levels.WARN):
     grid.apply()
 
     e_centres = TRUE_BINNING['true_energy'].weighted_centers.m_as('GeV')
-    fake_atm_flux_1d = 2e-18 * (e_centres / 1e5) ** -3.7   # GeV^-1 cm^-2 s^-1 sr^-1
+    fake_atm_flux_1d = 2e-14 * (e_centres / 1e5) ** -3.7   # GeV^-1 m^-2 s^-1 sr^-1
     fake_atm_flux = np.repeat(fake_atm_flux_1d[:, None], TRUE_BINNING.shape[1], axis=1).ravel()
     for container in grid.data:
         container['weights'] = container['initial_weights'] * fake_atm_flux
@@ -255,7 +257,7 @@ def test_astro_adds_to_weights(verbosity=Levels.WARN):
     astro.compute()
     astro.apply()
 
-    astro_flux_1d = 1.3 * 0.787e-18 * (e_centres / 1e5) ** (-2.5 + 0.2)
+    astro_flux_1d = 1.3 * 0.787e-14 * (e_centres / 1e5) ** (-2.5 + 0.2)
     astro_flux = np.repeat(astro_flux_1d[:, None], TRUE_BINNING.shape[1], axis=1).ravel()
     for container in astro.data:
         volume = container['initial_weights']
@@ -266,7 +268,169 @@ def test_astro_adds_to_weights(verbosity=Levels.WARN):
     logging.info('<< PASS : test_astro_adds_to_weights >>')
 
 
+def make_atmospheric_config(response_file, channels, with_detector=True):
+    """
+    Binned pipeline with daemonflux, prob3 and the astrophysical flux.
+
+    Parameters
+    ----------
+    response_file : str
+        Binned response file with TRUE_BINNING and RECO_BINNING.
+    channels : list of str
+        Container names.
+    with_detector : bool
+        If False, stop after the fluxes (output on the true binning), so that
+        the folding can be redone by hand.
+
+    Returns
+    -------
+    OrderedDict
+    """
+    # pylint: disable=import-outside-toplevel
+    from pisa.stages.flux.daemon_flux import init_test as daemon_init_test
+    daemon_params = daemon_init_test(**PARAM_DEFAULTS).params
+    for one_param in daemon_params:
+        one_param.value = 0.0 * one_param.value.units   # baseline daemonflux
+
+    cfg = OrderedDict()
+    cfg['pipeline'] = {
+        'name': 'binned_atm_test',
+        'output_binning': RECO_BINNING if with_detector else TRUE_BINNING,
+        'output_key': ('weights'),
+        'detector_name': None,
+    }
+    cfg[('data', 'binned_grid')] = {
+        'calc_mode': TRUE_BINNING, 'apply_mode': TRUE_BINNING, 'output_names': channels,
+    }
+    cfg[('flux', 'daemon_flux')] = {
+        'calc_mode': TRUE_BINNING, 'apply_mode': None,
+        # The stage's default grid stops at 100 TeV; daemonflux goes much higher
+        'energy_grid': np.logspace(1, 7.5, 400) * ureg.GeV,
+        'params': daemon_params,
+    }
+    cfg[('osc', 'prob3')] = {
+        'calc_mode': TRUE_BINNING, 'apply_mode': TRUE_BINNING,
+        'params': ParamSet([
+            Param(name='detector_depth', value=2.6 * ureg.km, **PARAM_DEFAULTS),
+            Param(name='prop_height', value=18 * ureg.km, **PARAM_DEFAULTS),
+            Param(name='earth_model', value='osc/PREM_12layer.dat', **PARAM_DEFAULTS),
+            Param(name='YeI', value=0.4656, **PARAM_DEFAULTS),
+            Param(name='YeO', value=0.4957, **PARAM_DEFAULTS),
+            Param(name='YeM', value=0.4957, **PARAM_DEFAULTS),
+            Param(name='theta12', value=33.4 * ureg.degree, **PARAM_DEFAULTS),
+            Param(name='theta13', value=8.6 * ureg.degree, **PARAM_DEFAULTS),
+            Param(name='theta23', value=45 * ureg.degree, **PARAM_DEFAULTS),
+            Param(name='deltam21', value=7.4e-5 * ureg.eV**2, **PARAM_DEFAULTS),
+            Param(name='deltam31', value=2.5e-3 * ureg.eV**2, **PARAM_DEFAULTS),
+            Param(name='deltacp', value=0 * ureg.degree, **PARAM_DEFAULTS),
+        ]),
+    }
+    cfg[('flux', 'astrophysical')] = {
+        'calc_mode': TRUE_BINNING, 'apply_mode': TRUE_BINNING,
+        'params': ParamSet([
+            Param(name='astro_norm', value=1.0, **PARAM_DEFAULTS),
+            Param(name='astro_delta', value=0.0, **PARAM_DEFAULTS),
+        ]),
+    }
+    if with_detector:
+        cfg[('aeff', 'table')] = {
+            'calc_mode': None, 'apply_mode': TRUE_BINNING,
+            'response_file': response_file,
+            'params': ParamSet([
+                Param(name='livetime', value=LIVETIME, **PARAM_DEFAULTS),
+                Param(name='aeff_scale', value=1.0, **PARAM_DEFAULTS),
+            ]),
+        }
+        cfg[('reco', 'response_matrix')] = {
+            'calc_mode': TRUE_BINNING, 'apply_mode': RECO_BINNING,
+            'response_file': response_file,
+        }
+    return cfg
+
+
+def test_binned_pipeline_atmospheric(verbosity=Levels.WARN):
+    """
+    Binned pipeline with daemonflux + prob3 + astrophysical flux.
+
+    Checks: (1) the detector stages fold the flux-weighted true counts exactly;
+    (2) fluxes in the containers are in PISA units (GeV^-1 m^-2 s^-1 sr^-1):
+    daemonflux values are bracketed by the package's own values at the
+    neighbouring tabulated zenith angles, and the astrophysical flux equals its
+    formula; (3) oscillations: upgoing numu survival is ~1 at high energy and
+    clearly below 1 near 100 GeV.
+    """
+    # pylint: disable=import-outside-toplevel
+    from daemonflux import Flux
+    set_verbosity(verbosity)
+    channels = ['nue_cc', 'numu_cc', 'nutau_cc', 'numubar_nc']
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        response_file = os.path.join(tmpdir, 'toy_response.json')
+        aeff, response = make_toy_response(TRUE_BINNING, RECO_BINNING, channels)
+        write_response_file(response_file, TRUE_BINNING, RECO_BINNING, aeff,
+                            response, description='atmospheric closure test')
+        loaded = load_response_file(response_file)
+
+        pipe_true = Pipeline(make_atmospheric_config(response_file, channels, False))
+        true_maps = pipe_true.get_outputs()
+        pipe_reco = Pipeline(make_atmospheric_config(response_file, channels, True))
+        reco_maps = pipe_reco.get_outputs()
+
+    # (1) Folding the flux-weighted true counts by hand
+    livetime_s = LIVETIME.m_as('s')
+    for name in channels:
+        counts_true = true_maps[name].nominal_values * loaded['aeff'][name] * livetime_s
+        reference = np.tensordot(counts_true, loaded['response'][name], axes=2)
+        check_closure(reco_maps[name].nominal_values, reference, f'atm {name}')
+
+    # (2a) daemonflux numu (neutrinos only, as the stage requests) in the container, in m^-2
+    container = pipe_true.data['numu_cc']
+    energy = container['true_energy']
+    coszen = container['true_coszen']
+    flux_obj = Flux(location='IceCube', use_calibration=True)
+    tab_zenith = np.array(sorted(float(z) for z in flux_obj.zenith_angles))
+    tab_strings = {float(z): z for z in flux_obj.zenith_angles}
+    zenith = np.degrees(np.arccos(coszen))
+    n_checked = 0
+    for ientry in range(0, energy.size, 7):
+        if energy[ientry] > 3e7:
+            continue
+        i_hi = np.searchsorted(tab_zenith, zenith[ientry])
+        if i_hi == 0 or i_hi == tab_zenith.size:
+            continue
+        bracket = []
+        for one_zen in [tab_zenith[i_hi - 1], tab_zenith[i_hi]]:
+            e3_flux = flux_obj.flux(np.array([energy[ientry]]), tab_strings[one_zen], 'numu')
+            bracket.append(float(np.atleast_1d(e3_flux)[0]) * 1e4 / energy[ientry]**3)   # cm^-2 -> m^-2
+        value = container['nu_flux'][ientry, 1]
+        assert min(bracket) * 0.98 <= value <= max(bracket) * 1.02, (energy[ientry], value, bracket)
+        n_checked += 1
+    assert n_checked > 10
+    logging.info('daemonflux numu flux in m^-2 checked at %d grid points', n_checked)
+
+    # (2b) astrophysical flux in m^-2
+    expected_astro = 0.787e-14 * (energy / 1e5) ** -2.5
+    assert np.allclose(container['astro_flux'], expected_astro, rtol=1e-6, atol=0)
+
+    # (3) Oscillations
+    prob_mumu = container['prob_mu']
+    upgoing = coszen < -0.8
+    high = upgoing * (energy > 1e4)
+    low = upgoing * (energy > 1e2) * (energy < 2e2)
+    assert np.all(np.abs(prob_mumu[high] - 1) < 1e-3)
+    assert np.all(prob_mumu[low] < 0.99)
+    logging.info('upgoing P(numu->numu): %.4f near 100 GeV, %.5f above 10 TeV',
+                 prob_mumu[low].mean(), prob_mumu[high].mean())
+
+    # Rates per year for the toy detector, for orientation only
+    for name in channels:
+        logging.info('%s: %.4g events/yr in reco binning', name,
+                     reco_maps[name].nominal_values.sum())
+    logging.info('<< PASS : test_binned_pipeline_atmospheric >>')
+
+
 if __name__ == '__main__':
     test_binned_pipeline(verbosity=Levels.INFO)
     test_binned_pipeline_astro(verbosity=Levels.INFO)
     test_astro_adds_to_weights(verbosity=Levels.INFO)
+    test_binned_pipeline_atmospheric(verbosity=Levels.INFO)

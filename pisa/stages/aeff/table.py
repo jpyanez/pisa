@@ -34,11 +34,12 @@ class table(Stage):  # pylint: disable=invalid-name
 
     In each true bin the weights are multiplied by
 
-        aeff_scale * A_eff [cm^2] * livetime [s].
+        aeff_scale * A_eff [m^2] * livetime [s].
 
     With `data.binned_grid` upstream (weights = bin volume in GeV sr) and a
-    flux stage in between (GeV^-1 cm^-2 s^-1 sr^-1), the result is the
-    expected number of events per true bin.
+    flux stage in between (GeV^-1 m^-2 s^-1 sr^-1, the PISA flux convention,
+    e.g. `flux.daemon_flux`), the result is the expected number of events per
+    true bin.
 
     Parameters
     ----------
@@ -81,10 +82,10 @@ class table(Stage):  # pylint: disable=invalid-name
 
         loaded = load_response_file(self.response_file)
         self.true_binning = loaded['true_binning']
-        # Flattened in binning order, converted to cm^2 to match PISA flux units
-        self.aeff_cm2 = {}
+        # Flattened in binning order, in m^2 to match PISA flux units (per m^2)
+        self.aeff_m2 = {}
         for name, aeff_m2 in loaded['aeff'].items():
-            self.aeff_cm2[name] = (aeff_m2 * 1e4).ravel().astype(FTYPE)
+            self.aeff_m2[name] = aeff_m2.ravel().astype(FTYPE)
 
     def setup_function(self):
         # The file must describe exactly the binning the weights live on
@@ -96,7 +97,7 @@ class table(Stage):  # pylint: disable=invalid-name
                 f'vs\n{self.apply_mode}'
             )
         for container in self.data:
-            if container.name not in self.aeff_cm2:
+            if container.name not in self.aeff_m2:
                 raise KeyError(
                     f'No effective area for container "{container.name}" '
                     f'in {self.response_file}'
@@ -107,7 +108,7 @@ class table(Stage):  # pylint: disable=invalid-name
         livetime_s = self.params.livetime.m_as('sec')
 
         for container in self.data:
-            scale = aeff_scale * livetime_s * self.aeff_cm2[container.name]
+            scale = aeff_scale * livetime_s * self.aeff_m2[container.name]
             container['weights'] *= scale
             container.mark_changed('weights')
 

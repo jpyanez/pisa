@@ -24,8 +24,13 @@ class astrophysical(Stage):  # pylint: disable=invalid-name
 
     the same for every container, i.e. a 1:1:1 flavour ratio and equal
     neutrino and antineutrino fluxes. The per-flavour neutrino+antineutrino
-    normalisation at 100 TeV is therefore 2 * 0.787e-18 = 1.574e-18 for
-    astro_norm = 1. The flux is isotropic.
+    normalisation at 100 TeV is therefore 2 * 0.787e-18 = 1.574e-18
+    GeV^-1 cm^-2 s^-1 sr^-1 for astro_norm = 1. The flux is isotropic.
+
+    Internally the flux is stored in GeV^-1 m^-2 s^-1 sr^-1 (0.787e-14 at
+    100 TeV), the convention of the other PISA flux stages (e.g.
+    `flux.daemon_flux`, `flux.honda_ip`), so that it combines with them and
+    with effective areas in m^2.
 
     On apply, `initial_weights * astro_flux` is *added* to `weights`, so that
     every later stage (effective area, absorption, reconstruction) acts on the
@@ -68,7 +73,9 @@ class astrophysical(Stage):  # pylint: disable=invalid-name
 
     def __init__(self, astro_only=False, **std_kwargs):
         self._central_gamma = FTYPE(-2.5)
-        self._central_norm = FTYPE(0.787e-18)  # GeV^-1 cm^-2 s^-1 sr^-1, per nu type
+        # Per neutrino type at the pivot: 0.787e-18 GeV^-1 cm^-2 s^-1 sr^-1,
+        # converted to the PISA flux unit GeV^-1 m^-2 s^-1 sr^-1
+        self._central_norm = FTYPE(0.787e-18 * 1e4)
         self.astro_only = bool(astro_only)
 
         expected_params = (

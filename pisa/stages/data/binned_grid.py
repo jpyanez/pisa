@@ -70,9 +70,9 @@ class binned_grid(Stage):  # pylint: disable=invalid-name
 
         Delta E [GeV] * 2 pi * Delta cos(zenith) [sr],
 
-    so that a differential flux in GeV^-1 cm^-2 s^-1 sr^-1, multiplied by an
-    effective area in cm^2 and a livetime in s, gives the expected number of
-    events in each bin. `weights` are reset to `initial_weights` on every
+    so that a differential flux in GeV^-1 m^-2 s^-1 sr^-1 (the PISA flux
+    convention), multiplied by an effective area in m^2 and a livetime in s,
+    gives the expected number of events in each bin. `weights` are reset to `initial_weights` on every
     apply.
 
     Parameters
