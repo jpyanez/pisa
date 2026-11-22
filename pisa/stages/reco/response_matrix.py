@@ -56,9 +56,6 @@ class response_matrix(Stage):  # pylint: disable=invalid-name
     containers from the true to the reco binning. Only binned stages should
     follow it.
 
-    If a container has "astro_weights" (written by `flux.astrophysical`),
-    they are added to "weights" before the mapping, as in `utils.hist`.
-
     Expected container keys are::
 
         "weights"
@@ -126,8 +123,6 @@ class response_matrix(Stage):  # pylint: disable=invalid-name
             # Read the expected counts per true bin
             container.representation = self.calc_mode
             weights = container['weights']
-            if 'astro_weights' in container.keys:
-                weights = weights + container['astro_weights']
 
             counts_reco = weights @ self.matrices[container.name]
 

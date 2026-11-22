@@ -8,40 +8,68 @@ from pisa.core.param import Param, ParamSet
 from pisa.core.stage import Stage
 from pisa.utils.profiler import profile
 
-__all__ = ['astrophysical', 'spectral_index_scale', 'apply_sys_loop', 'init_test']
+__all__ = ['astrophysical', 'spectral_index_scale', 'init_test']
 
-PIVOT = FTYPE(100.0e3)
+PIVOT = FTYPE(100.0e3)  # GeV
 
 
 class astrophysical(Stage):  # pylint: disable=invalid-name
     """
-    Stage to apply power law astrophysical fluxes
+    Stage to add a power-law astrophysical neutrino flux to the weights.
+
+    The flux of each neutrino type (flavour, neutrino or antineutrino) is
+
+        astro_norm * 0.787e-18 * (E / 100 TeV)**(-2.5 + astro_delta)
+        [GeV^-1 cm^-2 s^-1 sr^-1],
+
+    the same for every container, i.e. a 1:1:1 flavour ratio and equal
+    neutrino and antineutrino fluxes. The per-flavour neutrino+antineutrino
+    normalisation at 100 TeV is therefore 2 * 0.787e-18 = 1.574e-18 for
+    astro_norm = 1. The flux is isotropic.
+
+    On apply, `initial_weights * astro_flux` is *added* to `weights`, so that
+    every later stage (effective area, absorption, reconstruction) acts on the
+    sum of atmospheric and astrophysical contributions. This requires the
+    incoming `weights` to carry the atmospheric flux already: place this stage
+    after the stage that multiplies the atmospheric flux into the weights
+    (e.g. `osc.prob3`) and before the effective-area stage. Earth oscillations
+    of the astrophysical flux are neglected (they matter only near 100 GeV,
+    where the astrophysical flux is ~1e-3 of the atmospheric one).
+
+    For a pipeline with no atmospheric flux, set `astro_only=True`: the
+    weights are then replaced by `initial_weights * astro_flux`.
 
     Parameters
     ----------
+    astro_only : bool
+        Replace the weights instead of adding to them.
+
     params : ParamSet
         Must have parameters::
 
             astro_delta : quantity (dimensionless)
+                Shift of the spectral index; positive values harden the spectrum.
             astro_norm : quantity (dimensionless)
+                Scale of the normalisation relative to 0.787e-18.
 
     Notes
     -----
 
     Expected container keys are::
 
-        "true_energy", "true_coszen", "initial_weights"
+        "true_energy", "initial_weights", "weights"
 
-    TODO: flavor ratio as a parameter? Save for later.
+    In binned pipelines (`data.binned_grid`) `initial_weights` is the bin
+    volume in GeV sr, so the added term is the flux integrated over the bin
+    (evaluated at the bin centre).
+
+    TODO: flavour ratio and neutrino/antineutrino fraction as parameters.
     """
 
-    def __init__(self, **std_kwargs):
+    def __init__(self, astro_only=False, **std_kwargs):
         self._central_gamma = FTYPE(-2.5)
-        self._central_norm = FTYPE(0.787e-18)
-
-        self._e_ratio = FTYPE(1.0)
-        self._mu_ratio = FTYPE(1.0)
-        self._tau_ratio = FTYPE(1.0)
+        self._central_norm = FTYPE(0.787e-18)  # GeV^-1 cm^-2 s^-1 sr^-1, per nu type
+        self.astro_only = bool(astro_only)
 
         expected_params = (
             "astro_delta",
@@ -50,8 +78,8 @@ class astrophysical(Stage):  # pylint: disable=invalid-name
 
         expected_container_keys = (
             'true_energy',
-            'true_coszen',
             'initial_weights',
+            'weights',
         )
 
         super().__init__(
@@ -62,55 +90,41 @@ class astrophysical(Stage):  # pylint: disable=invalid-name
 
     def setup_function(self):
         """
-        Setup the nominal flux
+        Compute the nominal flux at each entry
         """
         for container in self.data:
-            container["astro_weights"] = np.ones(container.size, dtype=FTYPE)
-            container["astro_flux"] = np.ones(container.size, dtype=FTYPE)
-            container["astro_flux_nominal"] = np.ones(container.size, dtype=FTYPE)
-
-        # Loop over containers
-        for container in self.data:
-
-            # Grab containers here once to save time
             true_energy = container["true_energy"]
-
-            container["astro_flux_nominal"] = self._central_norm * np.power(
-                (true_energy / PIVOT), self._central_gamma
-            )
-
-            # TODO split this up so that we can use flavor ratios
-            # nu_flux_nominal[:,0] = _precalc*self._e_ratio
-            # nu_flux_nominal[:,1] = _precalc*self._mu_ratio
-            # nu_flux_nominal[:,2] = _precalc*self._tau_ratio
-
+            container["astro_flux_nominal"] = (
+                self._central_norm * np.power(true_energy / PIVOT, self._central_gamma)
+            ).astype(FTYPE)
+            container["astro_flux"] = np.copy(container["astro_flux_nominal"])
             container.mark_changed("astro_flux_nominal")
+            container.mark_changed("astro_flux")
 
     @profile
     def compute_function(self):
         """
-        Tilt it, scale it, bop it
+        Apply the normalisation and the spectral-index shift
         """
         delta = self.params.astro_delta.value.m_as("dimensionless")
-        norm = self.params.astro_norm.value
+        norm = self.params.astro_norm.value.m_as("dimensionless")
 
         for container in self.data:
-            apply_sys_loop(
-                container["true_energy"],
-                container["true_coszen"],
-                FTYPE(delta),
-                FTYPE(norm),
-                container["astro_flux_nominal"],
-                out=container["astro_flux"],
-            )
+            spec_scale = spectral_index_scale(container["true_energy"], delta)
+            container["astro_flux"] = (
+                norm * container["astro_flux_nominal"] * spec_scale
+            ).astype(FTYPE)
             container.mark_changed("astro_flux")
 
     @profile
     def apply_function(self):
         for container in self.data:
-            container["astro_weights"] = (
-                container["initial_weights"] * container["astro_flux"]
-            )
+            astro_term = container["initial_weights"] * container["astro_flux"]
+            if self.astro_only:
+                container["weights"] = astro_term
+            else:
+                container["weights"] = container["weights"] + astro_term
+            container.mark_changed("weights")
 
 
 def spectral_index_scale(true_energy, delta_index):
@@ -118,41 +132,20 @@ def spectral_index_scale(true_energy, delta_index):
     Calculate spectral index scale.
     Adjusts the weights for events in an energy dependent way according to a
     shift in spectral index, applied about a user-defined energy pivot.
+
+    Parameters
+    ----------
+    true_energy : np.ndarray
+        Neutrino energies, GeV.
+    delta_index : float
+        Shift of the spectral index.
+
+    Returns
+    -------
+    np.ndarray
+        (true_energy / PIVOT)**delta_index, same shape as `true_energy`.
     """
     return np.power(true_energy / PIVOT, delta_index)
-
-
-def apply_sys_loop(
-    true_energy,
-    true_coszen,
-    delta_index,
-    norm,
-    astroflux_nominal,
-    out,
-):
-    """
-    Calculation:
-      1) Start from nominal flux
-      2) Apply spectral index shift
-      3) Add contributions from MCEq-computed gradients
-
-    Array dimensions :
-        true_energy : [A]
-        true_coszen : [A]
-        delta_index : scalar float
-        norm : scalar float
-        astroflux_nominal : [A,B]
-        out : [A,B] (sys flux)
-    where:
-        A = num events
-        B = num flavors in flux (=3, e.g. e, mu, tau)
-    """
-
-    n_evts = astroflux_nominal.shape[0]
-
-    for event in range(n_evts):
-        spec_scale = spectral_index_scale(true_energy[event], delta_index)
-        out[event] = norm * astroflux_nominal[event] * spec_scale
 
 
 def init_test(**param_kwargs):
