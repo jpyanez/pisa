@@ -61,6 +61,21 @@ CHANNELS = ['nue_cc', 'numu_cc', 'numubar_nc']
 LIVETIME = 3.15e7 * ureg.s
 
 
+def nominal_response_systematics():
+    """
+    Response-systematics parameters of reco.response_matrix at nominal values.
+
+    Returns
+    -------
+    ParamSet
+    """
+    return ParamSet([
+        Param(name='reco_energy_scale', value=1.0, **PARAM_DEFAULTS),
+        Param(name='reco_energy_extra_smear', value=0.0, **PARAM_DEFAULTS),
+        Param(name='reco_coszen_extra_smear', value=0.0, **PARAM_DEFAULTS),
+    ])
+
+
 def make_test_config(response_file, astro=None):
     """
     Pipeline configuration for the closure test.
@@ -113,6 +128,7 @@ def make_test_config(response_file, astro=None):
         'calc_mode': TRUE_BINNING,
         'apply_mode': RECO_BINNING,
         'response_file': response_file,
+        'params': nominal_response_systematics(),
     }
     return cfg
 
@@ -344,6 +360,7 @@ def make_atmospheric_config(response_file, channels, with_detector=True):
         cfg[('reco', 'response_matrix')] = {
             'calc_mode': TRUE_BINNING, 'apply_mode': RECO_BINNING,
             'response_file': response_file,
+            'params': nominal_response_systematics(),
         }
     return cfg
 
