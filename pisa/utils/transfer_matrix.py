@@ -34,8 +34,10 @@ File layout (HDF5)::
 Limitations:
 
 * Flux above the highest true-energy bin is not propagated, so NC feed-down
-  from higher energies is missing. The true binning should extend about a
-  decade above the energies of interest.
+  and tau regeneration from higher energies are missing. With nuSQuIDS/CSMS
+  and an E^-2.5 flux, a grid cut at 10 PeV loses 1.3% of upgoing numu at
+  5 PeV and 8.5% at 10 PeV; a cut at 30 PeV loses 0.14% and 0.6%. Extend
+  the true binning about half a decade above the energies of interest.
 * nuSQuIDS places the detector at the Earth's surface; the overburden of a
   detector at depth is neglected.
 """
