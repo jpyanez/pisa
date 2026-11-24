@@ -334,6 +334,7 @@ def do_setup():
                 'pisa-fit_hypersurfaces = pisa.scripts.fit_hypersurfaces:main',
                 'pisa-make_events_file = pisa.scripts.make_events_file:main',
                 'pisa-make_nufit_theta23_spline_priors = pisa.scripts.make_nufit_theta23_spline_priors:main',
+                'pisa-make_transfer_matrices = pisa.scripts.make_transfer_matrices:main',
                 'pisa-test_flux_weights = pisa.scripts.test_flux_weights:main',
 
                 # Scripts in pisa_tests dir
