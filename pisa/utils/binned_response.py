@@ -583,6 +583,22 @@ def load_param_spec(source):
     Values between the tabulated energies are interpolated linearly in
     log10(E_true) and held constant outside them. A channel missing from
     'channels' uses 'default' if present.
+
+    The 'angular' model describes the error on the reconstructed direction.
+    Optional keys, each tabulated against 'log10_energy' like 'sigma':
+
+    * "psf": shape of the opening-angle distribution (a string, not tabulated)
+        - "gaussian" (default): 2D Gaussian of width "sigma" [deg]
+        - "double_gaussian": core "sigma" plus a second 2D Gaussian of width
+          "sigma_tail" [deg] holding the fraction "tail_fraction"
+        - "king": King function with width "sigma" [deg] and tail index
+          "gamma" (> 1; smaller gamma gives heavier power-law tails; it tends
+          to the 2D Gaussian as gamma -> infinity)
+    * "skew": asymmetry of the error along the zenith direction, in (-1, 1).
+      The zenith component of the error is stretched by (1 + skew) where it
+      increases the zenith angle and by (1 - skew) where it decreases it.
+    * "zenith_bias": shift of the reconstructed zenith angle [deg], positive
+      towards larger zenith angles (more upgoing).
     """
     spec = from_file(source) if isinstance(source, str) else source
     if spec.get('format_version') != FORMAT_VERSION:
@@ -597,10 +613,57 @@ def load_param_spec(source):
         for one_class in classes:
             if one_class not in channel['energy'] or one_class not in channel['coszen']:
                 raise ValueError(f'{name}: energy and coszen needed for class "{one_class}"')
-            model = channel['coszen'][one_class].get('model', 'gaussian_coszen')
+            cz_par = channel['coszen'][one_class]
+            model = cz_par.get('model', 'gaussian_coszen')
             if model not in ('gaussian_coszen', 'angular'):
                 raise ValueError(f'{name}: unknown coszen model "{model}"')
+            if model == 'angular':
+                _check_angular_spec(cz_par, f'{name}, {one_class}')
     return spec
+
+
+# Extra tabulated parameters needed by each PSF shape of the 'angular' model
+PSF_PARAMS = {
+    'gaussian': [],
+    'double_gaussian': ['sigma_tail', 'tail_fraction'],
+    'king': ['gamma'],
+}
+
+
+def _check_angular_spec(cz_par, label):
+    """
+    Check the PSF shape and parameter ranges of an 'angular' direction model.
+
+    Parameters
+    ----------
+    cz_par : dict
+        The "coszen" entry of one class (see `load_param_spec`).
+    label : str
+        Channel and class, for error messages.
+    """
+    psf = cz_par.get('psf', 'gaussian')
+    if psf not in PSF_PARAMS:
+        raise ValueError(f'{label}: unknown psf "{psf}", use one of {list(PSF_PARAMS)}')
+    n_energies = len(cz_par['log10_energy'])
+    for key in ['sigma'] + PSF_PARAMS[psf] + ['skew', 'zenith_bias']:
+        if key not in cz_par:
+            if key in ('skew', 'zenith_bias'):
+                continue
+            raise ValueError(f'{label}: psf "{psf}" needs "{key}"')
+        if len(cz_par[key]) != n_energies:
+            raise ValueError(f'{label}: "{key}" must have one value per log10_energy')
+    if np.any(np.asarray(cz_par['sigma'], dtype=float) <= 0):
+        raise ValueError(f'{label}: sigma must be > 0')
+    if psf == 'double_gaussian':
+        tail_fraction = np.asarray(cz_par['tail_fraction'], dtype=float)
+        if np.any(tail_fraction < 0) or np.any(tail_fraction > 1):
+            raise ValueError(f'{label}: tail_fraction must be in [0, 1]')
+        if np.any(np.asarray(cz_par['sigma_tail'], dtype=float) <= 0):
+            raise ValueError(f'{label}: sigma_tail must be > 0')
+    if psf == 'king' and np.any(np.asarray(cz_par['gamma'], dtype=float) <= 1):
+        raise ValueError(f'{label}: gamma must be > 1')
+    if 'skew' in cz_par and np.any(np.abs(np.asarray(cz_par['skew'], dtype=float)) >= 1):
+        raise ValueError(f'{label}: skew must be in (-1, 1)')
 
 
 def _interp_log10e(log10e, table_log10e, table_values):
@@ -609,44 +672,164 @@ def _interp_log10e(log10e, table_log10e, table_values):
                      np.asarray(table_values, dtype=float))
 
 
-def _angular_coszen_probabilities(cz_true, sigma_deg, cz_edges,
+def _radial_psf_quadrature(psf, sigma_deg,
+                           sigma_tail_deg=None,
+                           tail_fraction=0.,
+                           gamma=None,
+                           n_psi=48):
+    """
+    Quadrature points in opening angle for a radially symmetric PSF: the
+    midpoints of n_psi equal-probability slices of each component.
+
+    Parameters
+    ----------
+    psf : str
+        'gaussian', 'double_gaussian' or 'king' (see `load_param_spec`).
+    sigma_deg : float
+        Width of the (core) distribution, degrees.
+    sigma_tail_deg : float or None
+        Width of the tail Gaussian ('double_gaussian'), degrees.
+    tail_fraction : float
+        Probability in the tail Gaussian ('double_gaussian').
+    gamma : float or None
+        King tail index, > 1 ('king').
+    n_psi : int
+        Points per component.
+
+    Returns
+    -------
+    psi_deg : np.ndarray
+        Opening angles in degrees, capped at 180.
+    weights : np.ndarray
+        Probability of each point; they sum to 1.
+    """
+    quantiles = (np.arange(n_psi) + 0.5) / n_psi
+    # Inverse CDF of the Rayleigh distribution with unit width
+    rayleigh_unit = np.sqrt(-2. * np.log(1. - quantiles))
+
+    if psf == 'gaussian':
+        psi_deg = sigma_deg * rayleigh_unit
+        weights = np.full(n_psi, 1. / n_psi)
+    elif psf == 'double_gaussian':
+        psi_deg = np.concatenate([sigma_deg * rayleigh_unit, sigma_tail_deg * rayleigh_unit])
+        weights = np.concatenate([np.full(n_psi, (1. - tail_fraction) / n_psi),
+                                  np.full(n_psi, tail_fraction / n_psi)])
+    elif psf == 'king':
+        # King radial CDF: F(psi) = 1 - (1 + psi^2 / (2 gamma sigma^2))^(1 - gamma)
+        t_values = (1. - quantiles) ** (1. / (1. - gamma)) - 1.
+        psi_deg = sigma_deg * np.sqrt(2. * gamma * t_values)
+        weights = np.full(n_psi, 1. / n_psi)
+    else:
+        raise ValueError(f'Unknown psf "{psf}"')
+    return np.minimum(psi_deg, 180.), weights
+
+
+def _angular_coszen_probabilities(cz_true, cz_edges, sigma_deg,
+                                  psf='gaussian',
+                                  sigma_tail_deg=None,
+                                  tail_fraction=0.,
+                                  gamma=None,
+                                  skew=0.,
+                                  zenith_bias_deg=0.,
                                   n_psi=48, n_phi=48):
     """
-    P(cos(zenith)_reco in each bin | cos(zenith)_true) for a 2D Gaussian
-    angular error of width sigma (Rayleigh-distributed opening angle).
+    P(cos(zenith)_reco in each bin | cos(zenith)_true) for an angular error
+    on the reconstructed direction (see the 'angular' model in
+    `load_param_spec`).
+
+    The error is described in the plane tangent to the true direction, with
+    components along the zenith direction (u, positive towards larger zenith
+    angle) and across it (v). A radially symmetric PSF gives the opening
+    angle psi and a uniform position angle phi; skew stretches u by
+    (1 + skew) for u > 0 and (1 - skew) for u < 0, and the zenith bias is
+    added to u. The reconstructed direction is then the true one moved by
+    the resulting opening angle along the resulting position angle.
 
     Parameters
     ----------
     cz_true : np.ndarray
         True cos(zenith) values, shape (n,).
-    sigma_deg : np.ndarray
-        Angular resolution (2D Gaussian sigma) per entry, degrees, shape (n,).
     cz_edges : np.ndarray
         Reco cos(zenith) bin edges, shape (m + 1,).
+    sigma_deg : float
+        PSF width, degrees.
+    psf, sigma_tail_deg, tail_fraction, gamma
+        PSF shape, see `_radial_psf_quadrature`.
+    skew : float
+        Asymmetry along the zenith direction, in (-1, 1).
+    zenith_bias_deg : float
+        Shift of the reconstructed zenith angle, degrees.
     n_psi, n_phi : int
-        Quadrature points in opening angle (Rayleigh quantiles) and azimuth.
+        Quadrature points in opening angle (per PSF component) and azimuth.
 
     Returns
     -------
     np.ndarray
         Shape (n, m). Rows sum to 1 within the [-1, 1] range of cz_edges.
     """
-    # Opening angles at the midpoints of n_psi equal-probability slices of a
-    # Rayleigh distribution, and n_phi uniformly spaced azimuths
-    quantiles = (np.arange(n_psi) + 0.5) / n_psi
-    psi_unit = np.sqrt(-2. * np.log(1. - quantiles))   # Rayleigh with sigma = 1
+    psi_deg, psi_weights = _radial_psf_quadrature(psf, sigma_deg, sigma_tail_deg,
+                                                  tail_fraction, gamma, n_psi)
     phi = (np.arange(n_phi) + 0.5) / n_phi * 2. * np.pi
 
+    # Error components in the tangent plane, degrees: u along zenith, v across
+    u_deg = psi_deg[:, None] * np.cos(phi)[None, :]
+    v_deg = psi_deg[:, None] * np.sin(phi)[None, :]
+    weights = np.repeat(psi_weights[:, None], n_phi, axis=1) / n_phi
+
+    # Asymmetry and bias along the zenith direction
+    stretch = np.where(u_deg > 0, 1. + skew, 1. - skew)
+    u_deg = u_deg * stretch + zenith_bias_deg
+
+    # Back to an opening angle and a position angle (0 = towards larger zenith)
+    psi_new = np.radians(np.minimum(np.hypot(u_deg, v_deg), 180.))
+    phi_new = np.arctan2(v_deg, u_deg)
+
     out = np.zeros((len(cz_true), len(cz_edges) - 1))
-    for ientry, (one_cz, one_sigma) in enumerate(zip(cz_true, sigma_deg)):
-        psi = np.minimum(psi_unit * np.radians(one_sigma), np.pi)
+    for ientry, one_cz in enumerate(cz_true):
         sin_theta = np.sqrt(max(0., 1. - one_cz**2))
-        cz_reco = (one_cz * np.cos(psi)[:, None]
-                   + sin_theta * np.sin(psi)[:, None] * np.cos(phi)[None, :])
+        # Moving by psi towards larger zenith angle lowers cos(zenith)
+        cz_reco = one_cz * np.cos(psi_new) - sin_theta * np.sin(psi_new) * np.cos(phi_new)
         cz_reco = np.clip(cz_reco, -1., 1.)
-        counts, _ = np.histogram(cz_reco.ravel(), bins=cz_edges)
-        out[ientry] = counts / cz_reco.size
+        counts, _ = np.histogram(cz_reco.ravel(), bins=cz_edges, weights=weights.ravel())
+        out[ientry] = counts
     return out
+
+
+def _interp_angular_params(cz_par, log10e_true, coszen_res_scale=1.0):
+    """
+    Interpolate the parameters of an 'angular' direction model to the true
+    energies.
+
+    Parameters
+    ----------
+    cz_par : dict
+        The "coszen" entry of one class (see `load_param_spec`).
+    log10e_true : np.ndarray
+        log10(E_true / GeV), shape (n_E,).
+    coszen_res_scale : float
+        Multiplies the widths 'sigma' and 'sigma_tail' (not the shape
+        parameters or the bias).
+
+    Returns
+    -------
+    dict
+        'sigma', 'sigma_tail', 'tail_fraction', 'gamma', 'skew', 'zenith_bias',
+        each an array of shape (n_E,); 'sigma_tail' and 'gamma' are None-filled
+        object arrays when the PSF shape does not use them.
+    """
+    n_e = len(log10e_true)
+    values = {}
+    for key in ['sigma', 'sigma_tail', 'tail_fraction', 'gamma', 'skew', 'zenith_bias']:
+        if key in cz_par:
+            values[key] = _interp_log10e(log10e_true, cz_par['log10_energy'], cz_par[key])
+        elif key in ('tail_fraction', 'skew', 'zenith_bias'):
+            values[key] = np.zeros(n_e)
+        else:
+            values[key] = np.full(n_e, None, dtype=object)
+    values['sigma'] = values['sigma'] * coszen_res_scale
+    if cz_par.get('psf', 'gaussian') == 'double_gaussian':
+        values['sigma_tail'] = values['sigma_tail'] * coszen_res_scale
+    return values
 
 
 def make_param_response(true_binning, reco_binning, spec, channel_names,
@@ -724,6 +907,8 @@ def make_param_response(true_binning, reco_binning, spec, channel_names,
             cz_sigma = _interp_log10e(log10e_true, cz_par['log10_energy'],
                                       cz_par['sigma']) * coszen_res_scale
             model = cz_par.get('model', 'gaussian_coszen')
+            if model == 'angular':
+                psf_values = _interp_angular_params(cz_par, log10e_true, coszen_res_scale)
             for ie in range(n_e):
                 if model == 'gaussian_coszen':
                     # Gaussian in cos(zenith), reflected at -1 and +1
@@ -732,7 +917,15 @@ def make_param_response(true_binning, reco_binning, spec, channel_names,
                     probs += _gaussian_bin_probabilities(2. - cz_true, cz_sigma[ie], cz_reco_edges)
                 else:
                     probs = _angular_coszen_probabilities(
-                        cz_true, np.full(n_cz, cz_sigma[ie]), cz_reco_edges)
+                        cz_true, cz_reco_edges,
+                        sigma_deg=psf_values['sigma'][ie],
+                        psf=cz_par.get('psf', 'gaussian'),
+                        sigma_tail_deg=psf_values['sigma_tail'][ie],
+                        tail_fraction=psf_values['tail_fraction'][ie],
+                        gamma=psf_values['gamma'][ie],
+                        skew=psf_values['skew'][ie],
+                        zenith_bias_deg=psf_values['zenith_bias'][ie],
+                    )
                 coszen[iclass, ie] = probs
 
         responses[name] = {'pid': pid, 'energy': energy, 'coszen': coszen}

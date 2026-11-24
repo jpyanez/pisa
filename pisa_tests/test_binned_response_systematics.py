@@ -25,7 +25,7 @@ from pisa.utils.log import Levels, logging, set_verbosity
 __all__ = [
     'test_maps_basic', 'test_energy_scale_cross_check',
     'test_energy_smear_cross_check', 'test_coszen_smear_cross_check',
-    'test_angular_model_width', 'test_stage_closures',
+    'test_angular_model_width', 'test_angular_psf_shapes', 'test_stage_closures',
 ]
 
 __author__ = 'J. P. Yanez'
@@ -236,6 +236,98 @@ def test_angular_model_width(verbosity=Levels.WARN):
     logging.info('<< PASS : test_angular_model_width >>')
 
 
+def test_angular_psf_shapes(verbosity=Levels.WARN):
+    """Tails and skew of the 'angular' direction model: radial CDFs of the PSF
+    shapes, their Gaussian limits, the mean shift from skew and bias, the
+    effect of reco_coszen_res_scale, and spec validation."""
+    # pylint: disable=import-outside-toplevel, protected-access
+    from pisa.utils.binned_response import (
+        _angular_coszen_probabilities, _radial_psf_quadrature, load_param_spec
+    )
+    set_verbosity(verbosity)
+    n_psi = 48
+
+    # Radial CDFs of the quadrature points against the analytic CDFs
+    radii = np.array([0.5, 1., 2., 4., 8.])          # degrees
+    psi, weights = _radial_psf_quadrature('king', 1., gamma=2., n_psi=n_psi)
+    king_cdf = 1. - (1. + radii**2 / (2. * 2. * 1.**2)) ** (1. - 2.)
+    psi_dg, weights_dg = _radial_psf_quadrature('double_gaussian', 1., sigma_tail_deg=5.,
+                                                tail_fraction=0.2, n_psi=n_psi)
+    dg_cdf = (0.8 * (1. - np.exp(-radii**2 / 2.))
+              + 0.2 * (1. - np.exp(-radii**2 / (2. * 25.))))
+    for ir, one_r in enumerate(radii):
+        assert abs(np.sum(weights[psi < one_r]) - king_cdf[ir]) <= 1. / n_psi
+        assert abs(np.sum(weights_dg[psi_dg < one_r]) - dg_cdf[ir]) <= 1. / n_psi
+
+    # Gaussian limits: no tail fraction, and a King function with large gamma
+    cz_true = np.array([-0.9, -0.5, 0.0, 0.4])
+    cz_edges = np.linspace(-1., 1., 201)
+    gauss = _angular_coszen_probabilities(cz_true, cz_edges, 3.)
+    no_tail = _angular_coszen_probabilities(cz_true, cz_edges, 3., psf='double_gaussian',
+                                            sigma_tail_deg=20., tail_fraction=0.)
+    assert np.allclose(no_tail, gauss, rtol=0, atol=1e-12)
+    king_wide = _angular_coszen_probabilities(cz_true, cz_edges, 3., psf='king', gamma=1e4)
+    logging.info('King gamma=1e4 vs Gaussian: max |dP| %.2e', np.abs(king_wide - gauss).max())
+    assert np.abs(king_wide - gauss).max() < 0.01
+
+    # Heavy tails put probability far from the true direction (|dcz| > 0.2 at the horizon)
+    cz_centres = 0.5 * (cz_edges[:-1] + cz_edges[1:])
+    far = np.abs(cz_centres) > 0.2
+    king_heavy = _angular_coszen_probabilities(np.array([0.]), cz_edges, 3., psf='king', gamma=1.5)
+    logging.info('P(|dcz| > 0.2): King gamma=1.5 %.3f, Gaussian %.1e',
+                 king_heavy[0, far].sum(), gauss[2, far].sum())
+    assert king_heavy[0, far].sum() > 0.05 and gauss[2, far].sum() < 1e-6
+
+    # Skew at the horizon: the mean zenith error is skew * sigma * sqrt(2 / pi)
+    sigma_deg = 5.
+    for skew in [0.5, -0.5]:
+        probs = _angular_coszen_probabilities(np.array([0.]), cz_edges, sigma_deg, skew=skew)[0]
+        mean = np.sum(probs * cz_centres)
+        expected = -np.sin(np.radians(skew * sigma_deg * np.sqrt(2. / np.pi)))
+        logging.info('skew %+.1f: mean cz_reco %.4f, expected %.4f', skew, mean, expected)
+        assert abs(mean / expected - 1.) < 0.1
+
+    # Zenith bias moves the reconstructed zenith angle
+    for one_cz in [0., -0.5]:
+        probs = _angular_coszen_probabilities(np.array([one_cz]), cz_edges, 0.5,
+                                              zenith_bias_deg=3.)[0]
+        mean = np.sum(probs * cz_centres)
+        expected = np.cos(np.arccos(one_cz) + np.radians(3.))
+        logging.info('bias 3 deg at cz %.1f: mean cz_reco %.4f, expected %.4f',
+                     one_cz, mean, expected)
+        assert abs(mean - expected) < 0.002
+
+    # reco_coszen_res_scale scales both widths of a double Gaussian
+    spec = gaussian_spec(sigma_cz=2., cz_model='angular')
+    for one_class in ['cascade', 'track']:
+        cz_par = spec['channels']['default']['coszen'][one_class]
+        cz_par.update({'psf': 'double_gaussian', 'sigma_tail': [6., 6.],
+                       'tail_fraction': [0.1, 0.1], 'skew': [0.3, 0.3]})
+    scaled = make_param_response(TRUE_BINNING, RECO_BINNING, load_param_spec(spec), ['default'],
+                                 coszen_res_scale=1.5)['default']['coszen']
+    wider = deepcopy(spec)
+    for one_class in ['cascade', 'track']:
+        cz_par = wider['channels']['default']['coszen'][one_class]
+        cz_par['sigma'] = [3., 3.]
+        cz_par['sigma_tail'] = [9., 9.]
+    direct = make_param_response(TRUE_BINNING, RECO_BINNING, load_param_spec(wider),
+                                 ['default'])['default']['coszen']
+    assert np.allclose(scaled, direct, rtol=0, atol=1e-12)
+
+    # Invalid specifications are refused
+    bad_updates = [{'psf': 'lorentzian'}, {'psf': 'king', 'gamma': [1., 1.]},
+                   {'psf': 'double_gaussian'}, {'skew': [1., 1.]}]
+    for one_update in bad_updates:
+        bad = gaussian_spec(sigma_cz=2., cz_model='angular')
+        bad['channels']['default']['coszen']['cascade'].update(one_update)
+        try:
+            load_param_spec(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f'invalid spec accepted: {one_update}')
+    logging.info('<< PASS : test_angular_psf_shapes >>')
+
+
 def run_stage_pipeline(stage_key, stage_cfg, channels):
     """
     Run binned_grid -> one reco stage and return the reco maps.
@@ -325,4 +417,5 @@ if __name__ == '__main__':
     test_energy_smear_cross_check(verbosity=Levels.INFO)
     test_coszen_smear_cross_check(verbosity=Levels.INFO)
     test_angular_model_width(verbosity=Levels.INFO)
+    test_angular_psf_shapes(verbosity=Levels.INFO)
     test_stage_closures(verbosity=Levels.INFO)

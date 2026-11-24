@@ -40,8 +40,10 @@ class param(Stage):  # pylint: disable=invalid-name
     The response is factorised as in the PISA paper: the event class depends
     on true energy; the reco energy on true energy and class (a Gaussian in
     log10(E_reco / E_true)); the reco cos(zenith) on true energy, true
-    cos(zenith) and class (a Gaussian in cos(zenith), or a 2D Gaussian angular
-    error converted to cos(zenith)). Functions are tabulated versus true
+    cos(zenith) and class (a Gaussian in cos(zenith), or an angular error on
+    the direction converted to cos(zenith): 2D Gaussian, double Gaussian or
+    King point-spread function, optionally skewed and biased along the
+    zenith direction). Functions are tabulated versus true
     energy in a specification file (see
     `pisa.utils.binned_response.load_param_spec`).
 
@@ -52,7 +54,7 @@ class param(Stage):  # pylint: disable=invalid-name
 
     * `reco_energy_scale` multiplies the reco energy;
     * `reco_energy_res_scale` multiplies the width in log10(E_reco / E_true);
-    * `reco_coszen_res_scale` multiplies the cos(zenith) or angular width.
+    * `reco_coszen_res_scale` multiplies the cos(zenith) or angular widths.
 
     Parameters
     ----------
