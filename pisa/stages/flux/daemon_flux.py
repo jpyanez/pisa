@@ -15,6 +15,7 @@ from scipy import interpolate
 
 from pisa import FTYPE, ureg
 from pisa.core.binning import OneDimBinning
+from pisa.core.container import Container, ContainerSet
 from pisa.core.param import Param, ParamSet
 from pisa.core.stage import Stage
 from pisa.utils.comparisons import ALLCLOSE_KW
@@ -22,7 +23,8 @@ from pisa.utils.log import logging
 from pisa.utils.profiler import profile
 from pisa.utils.random_numbers import get_random_state
 
-__all__ = ['MIN_VERSION', 'ENERGY_GRID', 'daemon_flux', 'init_test']
+__all__ = ['MIN_VERSION', 'ENERGY_GRID', 'daemon_flux', 'init_test',
+           'test_linear_flux']
 
 MIN_VERSION = "0.8.0"
 """Minimum daemonflux package version for correct chi2 prior penalty"""
@@ -65,6 +67,17 @@ class daemon_flux(Stage):  # pylint: disable=invalid-name
         from daemonflux. If `None`, the default :py:data:`ENERGY_GRID`
         will be used.
 
+    use_linear_flux : bool (default: False)
+        Precompute, once at setup, the flux of every event at the nominal
+        parameters and its change per unit (1 sigma) shift of each daemonflux
+        parameter. Each compute is then a matrix-vector product instead of
+        rebuilding and evaluating the flux splines. This is exact (to
+        floating-point rounding) because the daemonflux flux,
+        exp(spline(log E)) * (1 + sum_k v_k J_k(log E)), is linear in the
+        parameters and so are the spline interpolation steps of this stage.
+        Costs 1 + n_params flux evaluations at setup and
+        (n_params + 1) * 2 floats per event of memory.
+
     params: ParamSet
         Must have parameters::
 
@@ -103,7 +116,7 @@ class daemon_flux(Stage):  # pylint: disable=invalid-name
     """
 
     def __init__(self, calibration_file=None, use_fast_interp=False, energy_grid=None,
-                 **std_kwargs):
+                 use_linear_flux=False, **std_kwargs):
         self.cal_file = calibration_file
         """Custom daemonflux calibration file"""
         if self.cal_file is not None:
@@ -122,6 +135,11 @@ class daemon_flux(Stage):  # pylint: disable=invalid-name
 
         self.fast_interp = use_fast_interp
         """Use numba-accelerated flux interpolation"""
+
+        if isinstance(use_linear_flux, str):
+            use_linear_flux = use_linear_flux.strip().lower() == 'true'
+        self.linear_flux = use_linear_flux
+        """Use precomputed per-event fluxes and their linear parameter dependence"""
 
         self.flux_obj = Flux(location='IceCube', use_calibration=True,
                              cal_file=self.cal_file)
@@ -223,6 +241,70 @@ class daemon_flux(Stage):  # pylint: disable=invalid-name
         for container in self.data:
             container['nu_flux'] = np.empty((container.size, 2), dtype=FTYPE)
 
+        if self.linear_flux:
+            self.setup_linear_flux()
+
+    def setup_linear_flux(self):
+        """
+        Precompute per-event fluxes for `use_linear_flux`.
+
+        Stores, per container, the nue(bar) & numu(bar) fluxes at nominal
+        parameter values (shape (n_events, 2)) and their change for a +1 sigma
+        shift of each daemonflux parameter (shape (n_params, n_events, 2)).
+        """
+        logging.info("daemon_flux: precomputing linear flux dependence for"
+                     " %d parameters", len(self.daemon_names))
+        nominal_params = {name: 0. for name in self.daemon_names}
+        self._lin_nominal = self.event_fluxes(params=nominal_params)
+        lin_shifts = {name: [] for name in self._lin_nominal}
+        for daemon_name in self.daemon_names:
+            shifted_params = dict(nominal_params)
+            shifted_params[daemon_name] = 1.
+            shifted = self.event_fluxes(params=shifted_params)
+            for name, flux in shifted.items():
+                lin_shifts[name].append(flux - self._lin_nominal[name])
+        self._lin_shifts = {}
+        for name, shifts in lin_shifts.items():
+            self._lin_shifts[name] = np.stack(shifts, axis=0)
+
+    def event_fluxes(self, params):
+        """
+        Fluxes of nue(bar) and numu(bar) for every event of every container.
+
+        Parameters
+        ----------
+        params : Dict[str, float]
+            daemonflux parameter values (in units of sigma).
+
+        Returns
+        -------
+        Dict[str, ndarray]
+            Container name -> array of shape (n_events, 2) with the nue(bar)
+            and numu(bar) fluxes, see :py:meth:`evaluate_flux_map`.
+        """
+        flux_maps = {}
+        for particle in ['numu', 'antinumu', 'nue', 'antinue']:
+            flux_maps[particle] = self.make_2d_flux_map(
+                particle=particle, params=params
+            )
+
+        fluxes = {}
+        for container in self.data:
+            nubar = container['nubar']
+            nu_flux = np.empty((container.size, 2), dtype=FTYPE)
+            nu_flux[:, 0] = self.evaluate_flux_map(
+                flux_map=flux_maps['antinue'] if nubar < 0 else flux_maps['nue'],
+                true_energy=container['true_energy'],
+                true_coszen=container['true_coszen']
+            )
+            nu_flux[:, 1] = self.evaluate_flux_map(
+                flux_map=flux_maps['antinumu'] if nubar < 0 else flux_maps['numu'],
+                true_energy=container['true_energy'],
+                true_coszen=container['true_coszen']
+            )
+            fluxes[container.name] = nu_flux
+        return fluxes
+
     @profile
     def compute_function(self):
         """
@@ -236,42 +318,25 @@ class daemon_flux(Stage):  # pylint: disable=invalid-name
         # update chi2 parameter
         self.params['daemon_chi2'].value = self.flux_obj.chi2(modif_param_dict)
 
-        # Compute flux maps
-        flux_map_numu = self.make_2d_flux_map(
-            particle='numu', params=modif_param_dict
-        )
-        flux_map_numubar = self.make_2d_flux_map(
-            particle='antinumu', params=modif_param_dict
-        )
-        flux_map_nue = self.make_2d_flux_map(
-            particle='nue', params=modif_param_dict
-        )
-        flux_map_nuebar = self.make_2d_flux_map(
-            particle='antinue', params=modif_param_dict
-        )
+        if self.linear_flux:
+            # flux = nominal + sum_k p_k * (flux change per +1 sigma of k)
+            param_values = np.array(
+                [modif_param_dict[name] for name in self.daemon_names], dtype=FTYPE
+            )
+            for container in self.data:
+                container['nu_flux'][:] = (
+                    self._lin_nominal[container.name]
+                    + np.tensordot(param_values, self._lin_shifts[container.name], axes=1)
+                )
+                container.mark_changed("nu_flux")
+            return
 
-        ntot = 0
-        #start_t = time.time()
         # Obtain modified fluxes using provided parameters at desired points
         # in true_energy and true_coszen now
+        fluxes = self.event_fluxes(params=modif_param_dict)
         for container in self.data:
-            nubar = container['nubar']
-            nue_flux = self.evaluate_flux_map(
-                flux_map=flux_map_nuebar if nubar < 0 else flux_map_nue,
-                true_energy=container['true_energy'],
-                true_coszen=container['true_coszen']
-            )
-            numu_flux = self.evaluate_flux_map(
-                flux_map=flux_map_numubar if nubar < 0 else flux_map_numu,
-                true_energy=container['true_energy'],
-                true_coszen=container['true_coszen']
-            )
-            container['nu_flux'][:, 0] = nue_flux
-            container['nu_flux'][:, 1] = numu_flux
+            container['nu_flux'][:] = fluxes[container.name]
             container.mark_changed("nu_flux")
-            ntot += len(container['true_energy'])
-        #stop_t = time.time()
-        #logging.info("PISA spline evaluation time (s, %d events): %s", ntot, f"{stop_t - start_t:.2e}")
 
 
     def make_2d_flux_map(self, particle='numuflux', params=None):
@@ -371,3 +436,62 @@ def init_test(**param_kwargs):
         param_set.append(param)
     param_set = ParamSet(*param_set)
     return daemon_flux(params=param_set)
+
+
+def test_linear_flux():
+    """
+    Check that `use_linear_flux=True` gives the same per-event fluxes and
+    daemon_chi2 as the full spline calculation, at nominal and at random
+    parameter values within +/- 3 sigma.
+    """
+    random_state = get_random_state(random_state=0)
+    n_events = 2000
+    # Only rounding differences are expected
+    rtol = 1e-10 if FTYPE == np.float64 else 1e-4
+
+    # Events spread over the energy and coszen range of typical samples
+    containers = []
+    for name, nubar in [('numu_cc', 1), ('numubar_cc', -1)]:
+        container = Container(name)
+        container.set_aux_data('nubar', nubar)
+        container['true_energy'] = np.power(
+            10., random_state.uniform(0., 3., n_events)
+        ).astype(FTYPE)
+        container['true_coszen'] = random_state.uniform(
+            -1., 1., n_events
+        ).astype(FTYPE)
+        containers.append(container)
+
+    services = {}
+    for use_linear_flux in [False, True]:
+        service = init_test(prior=None, range=None, is_fixed=False)
+        service.linear_flux = use_linear_flux
+        service.calc_mode = 'events'
+        service.data = ContainerSet('data', [c for c in containers])
+        service.setup()
+        services[use_linear_flux] = service
+
+    for i in range(4):
+        for param in services[False].params.free:
+            if i == 0:
+                value = 0.
+            else:
+                value = random_state.uniform(-3., 3.)
+            for service in services.values():
+                service.params[param.name].value = value * ureg.dimensionless
+        fluxes = {}
+        for use_linear_flux, service in services.items():
+            service.compute_function()
+            fluxes[use_linear_flux] = {
+                c.name: np.array(c['nu_flux'], copy=True) for c in service.data
+            }
+        for name in fluxes[False]:
+            assert np.allclose(
+                fluxes[True][name], fluxes[False][name], rtol=rtol, atol=0.
+            ), f'linear flux differs from spline flux for {name}'
+        assert np.isclose(
+            services[True].params['daemon_chi2'].value.m,
+            services[False].params['daemon_chi2'].value.m,
+        )
+    logging.info('<< PASS : test_linear_flux >>')
+
