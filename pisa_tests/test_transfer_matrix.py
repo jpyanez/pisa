@@ -265,7 +265,7 @@ def test_pipeline_with_transfer_matrix(verbosity=Levels.WARN):
         cfg[('data', 'binned_grid')] = {'calc_mode': TRUE_BINNING, 'apply_mode': TRUE_BINNING,
                                         'output_names': ALL_CHANNELS}
         cfg[('flux', 'astrophysical')] = {
-            'calc_mode': TRUE_BINNING, 'apply_mode': TRUE_BINNING, 'astro_only': True,
+            'calc_mode': TRUE_BINNING, 'apply_mode': TRUE_BINNING,
             'params': ParamSet([
                 Param(name='astro_norm', value=astro_norm, **PARAM_DEFAULTS),
                 Param(name='astro_delta', value=0., **PARAM_DEFAULTS),

@@ -34,21 +34,25 @@ class astrophysical(Stage):  # pylint: disable=invalid-name
 
     On apply, `initial_weights * astro_flux` is *added* to `weights`, so that
     every later stage (effective area, absorption, reconstruction) acts on the
-    sum of atmospheric and astrophysical contributions. This requires the
-    incoming `weights` to carry the atmospheric flux already: place this stage
-    after the stage that multiplies the atmospheric flux into the weights
-    (e.g. `osc.prob3`) and before the effective-area stage. Earth oscillations
-    of the astrophysical flux are neglected (they matter only near 100 GeV,
+    sum of atmospheric and astrophysical contributions. Place this stage after
+    the stage that multiplies the atmospheric flux into the weights (e.g.
+    `osc.prob3`) and before the effective-area stage. Earth oscillations of
+    the astrophysical flux are neglected (they matter only near 100 GeV,
     where the astrophysical flux is ~1e-3 of the atmospheric one).
 
-    For a pipeline with no atmospheric flux, set `astro_only=True`: the
-    weights are then replaced by `initial_weights * astro_flux`.
+    If no earlier stage has changed the weights (`weights` equal to
+    `initial_weights`, as the data stages leave them on every apply), there
+    is no atmospheric flux in the pipeline and the weights are *replaced* by
+    `initial_weights * astro_flux` instead.
+
+    Caveat: the check tests "weights untouched", not "flux applied". In a
+    pipeline without an atmospheric flux stage, put this stage before any
+    other stage that changes the weights (e.g. `xsec.*`, `aeff.*`), or its
+    term would be added to weights that carry no flux. A ValueError is raised
+    if some containers have untouched weights and others not.
 
     Parameters
     ----------
-    astro_only : bool
-        Replace the weights instead of adding to them.
-
     params : ParamSet
         Must have parameters::
 
@@ -71,12 +75,11 @@ class astrophysical(Stage):  # pylint: disable=invalid-name
     TODO: flavour ratio and neutrino/antineutrino fraction as parameters.
     """
 
-    def __init__(self, astro_only=False, **std_kwargs):
+    def __init__(self, **std_kwargs):
         self._central_gamma = FTYPE(-2.5)
         # Per neutrino type at the pivot: 0.787e-18 GeV^-1 cm^-2 s^-1 sr^-1,
         # converted to the PISA flux unit GeV^-1 m^-2 s^-1 sr^-1
         self._central_norm = FTYPE(0.787e-18 * 1e4)
-        self.astro_only = bool(astro_only)
 
         expected_params = (
             "astro_delta",
@@ -125,9 +128,22 @@ class astrophysical(Stage):  # pylint: disable=invalid-name
 
     @profile
     def apply_function(self):
+        # Untouched weights mean no atmospheric flux was applied: replace them
+        untouched = []
+        for container in self.data:
+            untouched.append(np.array_equal(container["weights"], container["initial_weights"]))
+        if any(untouched) and not all(untouched):
+            names = [c.name for c, flag in zip(self.data, untouched) if flag]
+            raise ValueError(
+                'flux.astrophysical: weights are untouched in some containers '
+                f'({names}) but not in others; cannot tell whether to add the '
+                'astrophysical flux or replace the weights'
+            )
+        replace = all(untouched)
+
         for container in self.data:
             astro_term = container["initial_weights"] * container["astro_flux"]
-            if self.astro_only:
+            if replace:
                 container["weights"] = astro_term
             else:
                 container["weights"] = container["weights"] + astro_term

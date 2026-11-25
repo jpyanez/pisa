@@ -23,7 +23,8 @@ from pisa.utils.binned_response import (
 from pisa.utils.log import Levels, logging, set_verbosity
 
 __all__ = ['TRUE_BINNING', 'RECO_BINNING', 'CHANNELS', 'test_binned_pipeline',
-           'test_binned_pipeline_astro', 'test_astro_adds_to_weights',
+           'test_binned_pipeline_astro', 'test_astro_mixed_weights_refused',
+           'test_astro_adds_to_weights',
            'test_binned_pipeline_atmospheric']
 
 __author__ = 'J. P. Yanez'
@@ -86,7 +87,8 @@ def make_test_config(response_file, astro=None):
         Binned response file with TRUE_BINNING and RECO_BINNING.
     astro : dict or None
         If given, insert `flux.astrophysical` after the grid, with keys
-        'astro_only' (bool), 'astro_norm' and 'astro_delta' (floats).
+        'astro_norm' and 'astro_delta' (floats). With no flux stage before it,
+        the stage replaces the weights by the astrophysical term.
 
     Returns
     -------
@@ -109,7 +111,6 @@ def make_test_config(response_file, astro=None):
         cfg[('flux', 'astrophysical')] = {
             'calc_mode': TRUE_BINNING,
             'apply_mode': TRUE_BINNING,
-            'astro_only': astro['astro_only'],
             'params': ParamSet([
                 Param(name='astro_norm', value=astro['astro_norm'], **PARAM_DEFAULTS),
                 Param(name='astro_delta', value=astro['astro_delta'], **PARAM_DEFAULTS),
@@ -162,7 +163,8 @@ def expected_counts(response_file, astro=None):
         astro_1d = (astro['astro_norm'] * 0.787e-14
                     * (e_centres / 1e5) ** (-2.5 + astro['astro_delta']))
         astro_flux = np.repeat(astro_1d[:, None], TRUE_BINNING.shape[1], axis=1)
-        flux = astro_flux if astro['astro_only'] else flux + astro_flux
+        # Untouched weights are replaced by the astrophysical term
+        flux = astro_flux
 
     total = np.zeros(RECO_BINNING.shape)
     for name in CHANNELS:
@@ -230,13 +232,47 @@ def test_binned_pipeline(verbosity=Levels.WARN):
 
 
 def test_binned_pipeline_astro(verbosity=Levels.WARN):
-    """Same closure with flux.astrophysical, replacing and adding to the weights."""
+    """Same closure with flux.astrophysical as the only flux: it finds the
+    weights untouched and replaces them."""
     set_verbosity(verbosity)
-    for astro_only in [True, False]:
-        astro = {'astro_only': astro_only, 'astro_norm': 1.3, 'astro_delta': 0.2}
-        output_hist, reference = run_closure(astro)
-        check_closure(output_hist, reference, f'astro_only={astro_only}')
+    astro = {'astro_norm': 1.3, 'astro_delta': 0.2}
+    output_hist, reference = run_closure(astro)
+    check_closure(output_hist, reference, 'astrophysical only')
     logging.info('<< PASS : test_binned_pipeline_astro >>')
+
+
+def test_astro_mixed_weights_refused(verbosity=Levels.WARN):
+    """flux.astrophysical stops if some containers carry a flux and others not."""
+    # pylint: disable=import-outside-toplevel
+    from pisa.core.container import ContainerSet
+    from pisa.stages.data.binned_grid import binned_grid
+    from pisa.stages.flux.astrophysical import astrophysical
+    set_verbosity(verbosity)
+
+    grid = binned_grid(output_names=CHANNELS, calc_mode=TRUE_BINNING,
+                       apply_mode=TRUE_BINNING)
+    grid.data = ContainerSet('data')
+    grid.setup()
+    grid.apply()
+    # Only the first channel gets a (fake) flux
+    first = grid.data[CHANNELS[0]]
+    first['weights'] = first['initial_weights'] * 2e-14
+
+    params = ParamSet([
+        Param(name='astro_norm', value=1.0, **PARAM_DEFAULTS),
+        Param(name='astro_delta', value=0.0, **PARAM_DEFAULTS),
+    ])
+    astro = astrophysical(params=params, calc_mode=TRUE_BINNING, apply_mode=TRUE_BINNING)
+    astro.data = grid.data
+    astro.setup()
+    astro.compute()
+    try:
+        astro.apply()
+    except ValueError as err:
+        assert 'untouched' in str(err)
+    else:
+        raise AssertionError('mixed untouched/flux weights not detected')
+    logging.info('<< PASS : test_astro_mixed_weights_refused >>')
 
 
 def test_astro_adds_to_weights(verbosity=Levels.WARN):
@@ -449,5 +485,6 @@ def test_binned_pipeline_atmospheric(verbosity=Levels.WARN):
 if __name__ == '__main__':
     test_binned_pipeline(verbosity=Levels.INFO)
     test_binned_pipeline_astro(verbosity=Levels.INFO)
+    test_astro_mixed_weights_refused(verbosity=Levels.INFO)
     test_astro_adds_to_weights(verbosity=Levels.INFO)
     test_binned_pipeline_atmospheric(verbosity=Levels.INFO)
