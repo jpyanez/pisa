@@ -2101,7 +2101,18 @@ class Analysis():
                 return np.nan
             return self._minimizer_callable(x, *args)
 
-        m = Minuit(loss_func, x0)
+        # Optional analytic gradient: a callable (x, hypo_maker, data_dist,
+        # metric) -> derivative of the minimized loss with respect to the
+        # rescaled free params x (Minuit's numerical gradient otherwise)
+        grad_func = None
+        if "gradient" in method_kwargs.keys():
+            gradient = method_kwargs["gradient"]
+
+            def grad_func(x):
+                return np.asarray(gradient(x, hypo_maker, data_dist, metric),
+                                  dtype=np.float64)
+
+        m = Minuit(loss_func, x0, grad=grad_func)
         m.limits = bounds
         # only initial step size, not very important
         if "errors" in method_kwargs.keys():
