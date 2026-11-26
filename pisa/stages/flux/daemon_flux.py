@@ -636,13 +636,20 @@ class SkyGridFlux:
                 jac = np.array(jac_list)        # (n_tables, n_model, n_E)
                 curv = np.array(curv_list)
                 n_add = int(add.sum())
+                curv_add = curv[:, add, :]
+                # Only parameters with a curvature term (none for the sky
+                # tables of the r8h6 bundle) need the second product
+                c_index = np.flatnonzero(np.any(curv_add != 0., axis=(0, 2)))
                 parts.append({
                     'f0': f0,
                     # additive responses as (n_tables * n_E, n_add)
                     'j_add': np.ascontiguousarray(
                         jac[:, add, :].transpose(0, 2, 1).reshape(-1, n_add)),
+                    # curvature of the additive parameters in c_index, as
+                    # (n_tables * n_E, len(c_index))
+                    'c_index': c_index,
                     'c_add': np.ascontiguousarray(
-                        curv[:, add, :].transpose(0, 2, 1).reshape(-1, n_add)),
+                        curv_add[:, c_index, :].transpose(0, 2, 1).reshape(f0.size, c_index.size)),
                     'j_fac': jac[:, self._factor, :],
                     'c_fac': curv[:, self._factor, :],
                 })
@@ -688,7 +695,10 @@ class SkyGridFlux:
         a_add = a[~self._factor]
         a_fac = a[self._factor]
         n_tables, n_e = part['f0'].shape
-        terms = part['j_add'] @ a_add + 0.5 * (part['c_add'] @ (a_add * a_add))
+        terms = part['j_add'] @ a_add
+        if part['c_index'].size > 0:
+            a_curv = a_add[part['c_index']]
+            terms += 0.5 * (part['c_add'] @ (a_curv * a_curv))
         s_add = 1.0 + terms.reshape(n_tables, n_e)
         if a_fac.size > 0:
             u = (part['j_fac'] * a_fac[None, :, None]
