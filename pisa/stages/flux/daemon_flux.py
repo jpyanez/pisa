@@ -438,6 +438,124 @@ class daemon_flux(Stage):  # pylint: disable=invalid-name
             container.mark_changed("nu_flux")
 
 
+    def current_shifts(self):
+        """
+        Current daemonflux parameter values (units of sigma).
+
+        Returns
+        -------
+        ndarray
+            One value per parameter, in :py:attr:`daemon_names` order (the
+            order of :py:attr:`daemon_params`).
+        """
+        shifts = np.empty(len(self.daemon_params))
+        for i, k in enumerate(self.daemon_params):
+            shifts[i] = self.params[k].value.m_as("dimensionless")
+        return shifts
+
+    def flux_gradient(self, flux_weights):
+        """
+        Derivative, with respect to the daemonflux parameters, of a quantity
+        that is linear in the per-event fluxes.
+
+        For a quantity Q = sum_i sum_f flux_weights[i, f] * nu_flux[i, f]
+        (with the weights held fixed) this returns dQ/dp_k for every
+        parameter p_k. Example: an expected bin count is linear in nu_flux
+        when every later stage only multiplies the event weights by factors
+        that do not depend on the flux, so a fit metric's gradient is this
+        method applied to d(metric)/d(nu_flux). Exact (no finite steps): the
+        bundle path differentiates the precomputed grid tables
+        (:py:meth:`SkyGridFlux.shift_gradient`); the daemonflux v1 path is
+        linear in its parameters, so its derivative is the change per +1
+        sigma, precomputed once.
+
+        Parameters
+        ----------
+        flux_weights : dict
+            Container name -> array of shape (n_events, 2) or
+            (n_rows, n_events, 2): weight of the nue(bar) and numu(bar) flux
+            of each event. Containers not in the dict count as zero.
+
+        Returns
+        -------
+        ndarray
+            Shape (n_params,) or (n_rows, n_params), in
+            :py:attr:`daemon_params` order, per unit shift (1 sigma).
+        """
+        single = None
+        if self.bundle is None and not hasattr(self, '_lin_shifts'):
+            self.setup_linear_flux()
+        grid_weights = {}
+        grad = None
+        for container in self.data:
+            if container.name not in flux_weights:
+                continue
+            coef = np.asarray(flux_weights[container.name], dtype=np.float64)
+            if single is None:
+                single = coef.ndim == 2
+            if coef.ndim == 2:
+                coef = coef[None, :, :]
+
+            if self.bundle is None:
+                # (n_rows, n_events, 2) x (n_params, n_events, 2)
+                one_grad = np.tensordot(coef, self._lin_shifts[container.name],
+                                        axes=([1, 2], [1, 2]))
+                grad = one_grad if grad is None else grad + one_grad
+                continue
+
+            # Bundle: event weights carried to the grid nodes, per species
+            matrix, uconv = self._sky_matrix[container.name]
+            bar = 'anti' if container['nubar'] < 0 else ''
+            for column, species in [(0, bar + 'nue'), (1, bar + 'numu')]:
+                on_grid = (matrix.T @ (coef[:, :, column] * uconv[None, :]).T).T
+                if species in grid_weights:
+                    grid_weights[species] = grid_weights[species] + on_grid
+                else:
+                    grid_weights[species] = on_grid
+
+        if self.bundle is not None:
+            shifts = self.current_shifts()
+            for species, weights in grid_weights.items():
+                one_grad = self.sky_grid.shift_gradient(species, shifts, weights)
+                grad = one_grad if grad is None else grad + one_grad
+        if grad is None:
+            return np.zeros(len(self.daemon_params))
+        if single:
+            return grad[0]
+        return grad
+
+    def event_flux_jacobian(self, container_name):
+        """
+        Derivative of every event's nue(bar) and numu(bar) flux with respect
+        to every daemonflux parameter, at the current parameter values.
+
+        Prefer :py:meth:`flux_gradient` when only a contraction with
+        per-event weights is needed: it is much faster and smaller.
+
+        Parameters
+        ----------
+        container_name : str
+
+        Returns
+        -------
+        ndarray
+            Shape (n_events, 2, n_params), parameters in
+            :py:attr:`daemon_params` order, per unit shift (1 sigma).
+        """
+        container = self.data[container_name]
+        if self.bundle is None:
+            if not hasattr(self, '_lin_shifts'):
+                self.setup_linear_flux()
+            return np.transpose(self._lin_shifts[container_name], (1, 2, 0))
+
+        matrix, uconv = self._sky_matrix[container_name]
+        shifts = self.current_shifts()
+        bar = 'anti' if container['nubar'] < 0 else ''
+        jac = np.empty((container.size, 2, len(self.daemon_params)))
+        for column, species in [(0, bar + 'nue'), (1, bar + 'numu')]:
+            jac[:, column, :] = (matrix @ self.sky_grid.grid_jacobian(species, shifts)) * uconv[:, None]
+        return jac
+
     def make_2d_flux_map(self, particle='numuflux', params=None):
         """
         Create an interpolated 2d (energy-coszen) flux map using daemonflux.
@@ -690,8 +808,21 @@ class SkyGridFlux:
         delta = self._errors * np.asarray(shifts, dtype=np.float64)
         return float(delta @ self._invcov @ delta)
 
-    def _table_flux(self, part, a):
-        """Flux of every table, shape (n_tables, n_E)."""
+    def _table_pieces(self, part, a):
+        """
+        Factors of the flux of every table at model parameters `a`.
+
+        Returns
+        -------
+        f0 : ndarray, shape (n_tables, n_E)
+            Nominal flux.
+        s_add : ndarray, shape (n_tables, n_E)
+            1 + sum of the additive terms (J a + C a^2 / 2).
+        u : ndarray or None, shape (n_tables, n_factor, n_E)
+            J a + C a^2 / 2 of each factor-type parameter.
+        s_fac : ndarray or float
+            Product of (1 + u) over the factor-type parameters.
+        """
         a_add = a[~self._factor]
         a_fac = a[self._factor]
         n_tables, n_e = part['f0'].shape
@@ -705,8 +836,45 @@ class SkyGridFlux:
                  + 0.5 * part['c_fac'] * (a_fac * a_fac)[None, :, None])
             s_fac = np.prod(1.0 + u, axis=1)
         else:
+            u = None
             s_fac = 1.0
-        return part['f0'] * s_add * s_fac
+        return part['f0'], s_add, u, s_fac
+
+    def _table_flux(self, part, a):
+        """Flux of every table, shape (n_tables, n_E)."""
+        f0, s_add, _, s_fac = self._table_pieces(part, a)
+        return f0 * s_add * s_fac
+
+    def _factor_derivative(self, part, a, s_add, u, j):
+        """
+        d(table flux)/d(a) of the j-th factor-type parameter, shape
+        (n_tables, n_E): f0 * s_add * prod_{i != j} (1 + u_i) * (J_j + C_j a_j).
+        """
+        a_fac = a[self._factor]
+        others = np.ones_like(s_add)
+        for i in range(u.shape[1]):
+            if i != j:
+                others = others * (1.0 + u[:, i, :])
+        return (part['f0'] * s_add * others
+                * (part['j_fac'][:, j, :] + part['c_fac'][:, j, :] * a_fac[j]))
+
+    def _parameter_chain(self, shifts):
+        """
+        Model parameters and their derivative with respect to the shifts.
+
+        Returns
+        -------
+        a : ndarray
+            Model parameters (daemonflux model order), as `model_values`.
+        da_dshift : ndarray
+            d a[_index[k]] / d shifts[k], in `names` order.
+        """
+        theta = np.zeros(self._n_model)
+        theta[self._index] = self._base_values + self._errors * np.asarray(shifts, dtype=np.float64)
+        a = np.where(self._log, np.expm1(theta), theta)
+        # log parameters: a = exp(theta) - 1
+        da_dtheta = np.where(self._log, np.exp(theta), 1.0)
+        return a, da_dtheta[self._index] * self._errors
 
     def grid_flux(self, species, shifts):
         """
@@ -735,6 +903,124 @@ class SkyGridFlux:
             flux = self._table_flux(he_part, a)
             out[:, self._he_mask] += self._blend[self._he_mask][None, :] * (self._w_he @ flux)
         return out
+
+    def shift_gradient(self, species, shifts, grid_weights):
+        """
+        Derivative of sum(grid_weights * grid_flux) with respect to the shifts.
+
+        The grid flux is linear in each table's flux and the tables depend on
+        the model parameters through J and C, so the derivative is exact. The
+        weights are first carried back to the tables (direction weights and
+        energy blend), then contracted with the table derivatives; the grid
+        Jacobian itself is never formed.
+
+        Parameters
+        ----------
+        species : str
+            One of the prepared species.
+        shifts : array_like
+            One value per parameter in :py:attr:`names` order.
+        grid_weights : array_like
+            Shape (n_grid,) or (n_rows, n_grid), on the layout of
+            ``grid_flux(...).ravel()`` (n_grid = 2 * n_cz_half * n_E).
+
+        Returns
+        -------
+        ndarray
+            Shape (n_params,) or (n_rows, n_params), `names` order, per unit
+            shift (1 sigma).
+        """
+        grid_weights = np.asarray(grid_weights, dtype=np.float64)
+        single = grid_weights.ndim == 1
+        if single:
+            grid_weights = grid_weights[None, :]
+        n_rows = grid_weights.shape[0]
+        n_cz = self._w_map.shape[0]
+        grid_weights = grid_weights.reshape(n_rows, n_cz, self.energy.size)
+
+        a, da_dshift = self._parameter_chain(shifts)
+        add_pos = np.flatnonzero(~self._factor)
+        fac_pos = np.flatnonzero(self._factor)
+        a_add = a[~self._factor]
+        grad_model = np.zeros((n_rows, self._n_model))
+
+        map_part, he_part = self._tables[species]
+        for part, mask, weights, blend in (
+                (map_part, self._map_mask, self._w_map, 1.0 - self._blend),
+                (he_part, self._he_mask, self._w_he, self._blend)):
+            if part is None:
+                continue
+            # Weight of each table and energy: sum over the cos(zenith) nodes
+            # of grid weight * direction weight, times the energy blend
+            part_weights = grid_weights[:, :, mask] * blend[mask][None, None, :]
+            table_weights = np.matmul(weights.T[None, :, :], part_weights)  # (n_rows, n_tables, n_E)
+            f0, s_add, u, s_fac = self._table_pieces(part, a)
+            n_tables, n_e = f0.shape
+
+            # Additive parameters: d T / d a_k = f0 * s_fac * (J_k + C_k a_k)
+            weighted = (table_weights * (f0 * s_fac)[None, :, :]).reshape(n_rows, n_tables * n_e)
+            grad_model[:, add_pos] += weighted @ part['j_add']
+            c_index = part['c_index']
+            if c_index.size > 0:
+                grad_model[:, add_pos[c_index]] += (weighted @ part['c_add']) * a_add[c_index][None, :]
+
+            # Factor-type parameters
+            flat_weights = table_weights.reshape(n_rows, n_tables * n_e)
+            for j, one_pos in enumerate(fac_pos):
+                d_table = self._factor_derivative(part, a, s_add, u, j)
+                grad_model[:, one_pos] += flat_weights @ d_table.ravel()
+
+        grad = grad_model[:, self._index] * da_dshift[None, :]
+        if single:
+            return grad[0]
+        return grad
+
+    def grid_jacobian(self, species, shifts):
+        """
+        Derivative of the grid flux with respect to every shift.
+
+        Parameters
+        ----------
+        species : str
+            One of the prepared species.
+        shifts : array_like
+            One value per parameter in :py:attr:`names` order.
+
+        Returns
+        -------
+        ndarray
+            Shape (n_grid, n_params), rows on the layout of
+            ``grid_flux(...).ravel()``. About 200 MB for the South Pole sky.
+        """
+        a, da_dshift = self._parameter_chain(shifts)
+        add_pos = np.flatnonzero(~self._factor)
+        fac_pos = np.flatnonzero(self._factor)
+        a_add = a[~self._factor]
+        n_cz = self._w_map.shape[0]
+        jac = np.zeros((n_cz, self.energy.size, self._n_model))
+
+        map_part, he_part = self._tables[species]
+        for part, mask, weights, blend in (
+                (map_part, self._map_mask, self._w_map, 1.0 - self._blend),
+                (he_part, self._he_mask, self._w_he, self._blend)):
+            if part is None:
+                continue
+            f0, s_add, u, s_fac = self._table_pieces(part, a)
+            n_tables, n_e = f0.shape
+            d_table = np.zeros((n_tables, n_e, self._n_model))
+            f0_sfac = (f0 * s_fac)[:, :, None]
+            d_table[:, :, add_pos] = f0_sfac * part['j_add'].reshape(n_tables, n_e, -1)
+            c_index = part['c_index']
+            if c_index.size > 0:
+                d_table[:, :, add_pos[c_index]] += (
+                    f0_sfac * part['c_add'].reshape(n_tables, n_e, -1) * a_add[c_index])
+            for j, one_pos in enumerate(fac_pos):
+                d_table[:, :, one_pos] = self._factor_derivative(part, a, s_add, u, j)
+            jac[:, mask, :] += (blend[mask][None, :, None]
+                                * np.tensordot(weights, d_table, axes=(1, 0)))
+
+        jac = jac[:, :, self._index] * da_dshift[None, None, :]
+        return jac.reshape(n_cz * self.energy.size, -1)
 
     def event_matrix(self, true_energy, true_coszen):
         """
@@ -926,3 +1212,123 @@ def test_sky_flux():
                                    rtol=rtol, atol=0.), \
                     f'sky flux differs from daemonflux for {container.name} {species}'
     logging.info('<< PASS : test_sky_flux >>')
+
+
+def _flux_gradient_check(service, random_state, n_params_checked=12, rtol=1e-6):
+    """
+    Compare `flux_gradient` and `event_flux_jacobian` of a set-up service
+    with central differences of its fluxes, at its current parameters.
+
+    Parameters
+    ----------
+    service : daemon_flux
+        Set up, with parameters at the point to check.
+    random_state : numpy.random.RandomState
+    n_params_checked : int
+        Number of parameters compared by finite differences (a random
+        subset, always including the factor-type ones if any).
+    rtol : float
+        Allowed relative difference, relative to the largest derivative.
+    """
+    service.compute_function()
+    # Random per-event weights for Q = sum(weights * nu_flux)
+    weights = {}
+    for container in service.data:
+        weights[container.name] = random_state.uniform(0., 1., (container.size, 2))
+    grad = service.flux_gradient(weights)
+    jacobians = {}
+    for container in service.data:
+        jacobians[container.name] = service.event_flux_jacobian(container.name)
+
+    def total(shift_values):
+        for name, value in zip(service.daemon_params, shift_values):
+            service.params[name].value = value * ureg.dimensionless
+        service.compute_function()
+        value = 0.
+        fluxes = {}
+        for container in service.data:
+            value += np.sum(weights[container.name] * container['nu_flux'])
+            fluxes[container.name] = np.array(container['nu_flux'], dtype=np.float64)
+        return value, fluxes
+
+    shifts = service.current_shifts()
+    checked = list(random_state.choice(len(shifts), size=min(n_params_checked, len(shifts)),
+                                       replace=False))
+    if service.bundle is not None:
+        for i, factor in enumerate(service.sky_grid._factor[service.sky_grid._index]):
+            if factor and i not in checked:
+                checked.append(i)
+    step = 1e-4
+    for i in checked:
+        up = shifts.copy()
+        up[i] += step
+        down = shifts.copy()
+        down[i] -= step
+        value_up, flux_up = total(up)
+        value_down, flux_down = total(down)
+        numeric = (value_up - value_down) / (2 * step)
+        assert np.isclose(grad[i], numeric, rtol=rtol, atol=rtol * np.max(np.abs(grad))), \
+            f'flux_gradient {service.daemon_params[i]}: {grad[i]} vs {numeric}'
+        for name, jac in jacobians.items():
+            numeric_jac = (flux_up[name] - flux_down[name]) / (2 * step)
+            assert np.allclose(jac[:, :, i], numeric_jac, rtol=0.,
+                               atol=rtol * np.max(np.abs(jac)) + 1e-6 * np.max(np.abs(numeric_jac))), \
+                f'event_flux_jacobian {service.daemon_params[i]} in {name}'
+    total(shifts)
+
+
+def test_flux_gradient():
+    """
+    `flux_gradient` and `event_flux_jacobian` against central differences:
+    daemonflux v1 (IceCube), and a bundle with a sky map if
+    PISA_DAEMONFLUX_TEST_BUNDLE is set (see :py:func:`test_sky_flux`).
+    """
+    import os
+
+    if FTYPE != np.float64:
+        logging.info('<< SKIP : test_flux_gradient (needs FTYPE float64) >>')
+        return
+    random_state = get_random_state(random_state=3)
+
+    def events(n_events):
+        containers = []
+        for name, nubar in [('numu_cc', 1), ('numubar_cc', -1)]:
+            container = Container(name)
+            container.set_aux_data('nubar', nubar)
+            container['true_energy'] = np.power(
+                10., random_state.uniform(0.3, 3., n_events)).astype(FTYPE)
+            container['true_coszen'] = random_state.uniform(-1., 1., n_events).astype(FTYPE)
+            containers.append(container)
+        return ContainerSet('data', containers)
+
+    # daemonflux v1 (linear in its parameters); its tables start above the
+    # default energy grid of daemonflux >= 0.10 (PISA issue #976)
+    if Version(daemon_version) < Version("0.10"):
+        service = init_test(prior=None, range=None, is_fixed=False)
+        service.calc_mode = 'events'
+        service.data = events(200)
+        service.setup()
+        _flux_gradient_check(service, random_state, n_params_checked=6)
+    else:
+        logging.info('test_flux_gradient: v1 part skipped (daemonflux >= 0.10)')
+
+    bundle = os.environ.get('PISA_DAEMONFLUX_TEST_BUNDLE')
+    if bundle is None or Version(daemon_version) < Version(MIN_VERSION_SKY):
+        logging.info('<< PASS : test_flux_gradient (v1 only; no PISA_DAEMONFLUX_TEST_BUNDLE) >>')
+        return
+    site = os.environ.get('PISA_DAEMONFLUX_TEST_SITE', 'SouthPole')
+    cal_file = os.environ.get('PISA_DAEMONFLUX_TEST_CAL')
+    flux_obj = Flux(bundle=bundle, cal_file=cal_file)
+    names = list(flux_obj._get_flux_instance(site)._params.known_parameters)
+    param_set = ParamSet(*[
+        Param(name=pisa_param_name(n), value=random_state.uniform(-1.5, 1.5) * ureg.dimensionless,
+              prior=None, range=None, is_fixed=False)
+        for n in names
+    ])
+    service = daemon_flux(params=param_set, bundle=bundle, sky_site=site,
+                          calibration_file=cal_file)
+    service.calc_mode = 'events'
+    service.data = events(300)
+    service.setup()
+    _flux_gradient_check(service, random_state)
+    logging.info('<< PASS : test_flux_gradient >>')
