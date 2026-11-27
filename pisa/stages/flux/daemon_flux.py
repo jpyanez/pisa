@@ -101,6 +101,13 @@ class daemon_flux(Stage):  # pylint: disable=invalid-name
     sky_cz_nodes : int (default: 401)
         Number of cos(zenith) nodes per hemisphere of :py:class:`SkyGridFlux`.
 
+    reduced_basis : str, optional
+        With `bundle`: JSON file of a reduced hadronic basis (yield parameters
+        h_j with theta(y_k, pt_k) = sum_j h_j * coefficients_j[k]). The fit
+        parameters are then the model parameters outside the basis' source
+        parameters plus the h_j, and `calibration_file` must be a fit in this
+        basis (its 'reduced_basis' entry). See :py:func:`load_reduced_basis`.
+
     params: ParamSet
         Must have parameters::
 
@@ -140,7 +147,8 @@ class daemon_flux(Stage):  # pylint: disable=invalid-name
 
     def __init__(self, calibration_file=None, use_fast_interp=False, energy_grid=None,
                  use_linear_flux=False, bundle=None, sky_site=None,
-                 sky_points_per_decade=60, sky_cz_nodes=401, **std_kwargs):
+                 sky_points_per_decade=60, sky_cz_nodes=401, reduced_basis=None,
+                 **std_kwargs):
         self.cal_file = calibration_file
         """Custom daemonflux calibration file"""
         if self.cal_file is not None:
@@ -173,6 +181,10 @@ class daemon_flux(Stage):  # pylint: disable=invalid-name
         self.sky_cz_nodes = int(sky_cz_nodes)
         self.sky_grid = None
         """SkyGridFlux, built at setup when a bundle is used"""
+        self.reduced_basis = reduced_basis
+        """Reduced hadronic basis file, or None"""
+        self._basis = None
+        """Fit parameters of the reduced basis (see load_reduced_basis)"""
 
         if self.bundle is not None:
             if Version(daemon_version) < Version(MIN_VERSION_SKY):
@@ -182,7 +194,12 @@ class daemon_flux(Stage):  # pylint: disable=invalid-name
                 )
             if self.sky_site is None:
                 raise ValueError('`sky_site` is required with `bundle`')
-            self.flux_obj = Flux(bundle=self.bundle, cal_file=self.cal_file)
+            if reduced_basis is None:
+                self.flux_obj = Flux(bundle=self.bundle, cal_file=self.cal_file)
+            else:
+                # The calibration is in the reduced basis, which daemonflux
+                # cannot read: tables from the bundle, parameters from the basis
+                self.flux_obj = Flux(bundle=self.bundle)
             if self.sky_site not in self.flux_obj.sky_sites:
                 raise ValueError(
                     f'Sky site {self.sky_site} not in the bundle'
@@ -240,7 +257,15 @@ class daemon_flux(Stage):  # pylint: disable=invalid-name
                 raise ValueError("Need uniformly-spaced log-energy values!")
             self._egrid_log_delta = egrid_log_deltas[0]
 
-        if self.bundle is None:
+        if self.bundle is not None and self.reduced_basis is not None:
+            if self.cal_file is None:
+                raise ValueError('`reduced_basis` needs a `calibration_file` fitted in that basis')
+            self._basis = load_reduced_basis(
+                self.reduced_basis, self.cal_file,
+                self.flux_obj._get_flux_instance(self.sky_site),
+            )
+            self.daemon_names = list(self._basis['names'])
+        elif self.bundle is None:
             self.daemon_names = self.flux_obj.params.known_parameters
         else:
             self.daemon_names = list(
@@ -315,7 +340,7 @@ class daemon_flux(Stage):  # pylint: disable=invalid-name
                      energy_grid[-1], self.sky_cz_nodes)
         self.sky_grid = SkyGridFlux(
             self.flux_obj, self.sky_site, ['nue', 'antinue', 'numu', 'antinumu'],
-            energy_grid, n_cz_half=self.sky_cz_nodes,
+            energy_grid, n_cz_half=self.sky_cz_nodes, basis=self._basis,
         )
         if self.sky_grid.names != self.daemon_names:
             raise ValueError('Parameter order of the sky map differs from the stage')
@@ -639,6 +664,81 @@ class daemon_flux(Stage):  # pylint: disable=invalid-name
         return flux_map(np.log10(true_energy), true_coszen) * uconv
 
 
+def load_reduced_basis(basis_file, calibration_file, sky):
+    """
+    Fit parameters of a reduced hadronic basis, for :py:class:`SkyGridFlux`.
+
+    The basis (harness decision 0042) replaces the yield and p_T parameters
+    of the daemonflux model ("source" parameters) by fewer parameters h_j:
+    theta(source_k) = sum_j h_j * coefficients_j[source_k]; directions
+    outside the span are fixed at 0. All other model parameters (continuation
+    knobs, primary flux) stay. The calibration is a fit in this basis: its
+    'reduced_basis' entry holds the best-fit values and covariance of the
+    kept parameters and the h_j (h_j values; kept values are at the top
+    level), and the sha256 of the basis file.
+
+    Parameters
+    ----------
+    basis_file : str
+        Basis JSON ('yield_parameters', each with 'name' and 'coefficients'
+        over the source parameters).
+    calibration_file : str
+        Fit result (pickle) in this basis.
+    sky : daemonflux sky entry
+        From `Flux._get_flux_instance(site)`; gives the model parameters.
+
+    Returns
+    -------
+    dict
+        'names' (kept model parameters in daemonflux order, then the h_j),
+        'values', 'cov' and 'transform' (n_model x n_names), as expected by
+        :py:class:`SkyGridFlux`.
+    """
+    import hashlib
+    import json
+    import pickle
+
+    with open(basis_file, 'rb') as f:
+        basis_bytes = f.read()
+    basis = json.loads(basis_bytes)
+    with open(calibration_file, 'rb') as f:
+        calibration = pickle.load(f, encoding='latin1')
+    if 'reduced_basis' not in calibration:
+        raise ValueError(f'{calibration_file} is not a fit in a reduced basis')
+    fit_basis = calibration['reduced_basis']
+    if fit_basis['sha256'] != hashlib.sha256(basis_bytes).hexdigest():
+        raise ValueError(f'{calibration_file} was fitted with another basis than {basis_file}')
+
+    model_names = list(sky._model.names)
+    yield_parameters = basis['yield_parameters']
+    source_names = list(yield_parameters[0]['coefficients'].keys())
+    for one_name in source_names:
+        if one_name not in model_names:
+            raise ValueError(f'Basis parameter {one_name} is not in the daemonflux model')
+    kept_names = [n for n in sky._params.known_parameters if n not in source_names]
+    h_names = [one_param['name'] for one_param in yield_parameters]
+    names = kept_names + h_names
+
+    # Model parameters per unit of each fit parameter
+    transform = np.zeros((len(model_names), len(names)))
+    for j, one_name in enumerate(kept_names):
+        transform[model_names.index(one_name), j] = 1.0
+    for j, one_param in enumerate(yield_parameters):
+        for one_source, coefficient in one_param['coefficients'].items():
+            transform[model_names.index(one_source), len(kept_names) + j] = coefficient
+
+    # h_j values in the 'reduced_basis' entry, kept parameters at the top level
+    values = np.empty(len(names))
+    for i, one_name in enumerate(names):
+        if one_name in fit_basis['params']:
+            values[i] = fit_basis['params'][one_name]['value']
+        else:
+            values[i] = calibration['params'][one_name]['value']
+    cov_index = [list(fit_basis['cov_params']).index(n) for n in names]
+    cov = np.asarray(fit_basis['cov_matrix'], dtype=np.float64)[np.ix_(cov_index, cov_index)]
+    return {'names': names, 'values': values, 'cov': cov, 'transform': transform}
+
+
 def pisa_param_name(daemon_name):
     """
     PISA parameter name of a daemonflux parameter.
@@ -692,21 +792,50 @@ class SkyGridFlux:
         Ascending energies (GeV) of the grid.
     n_cz_half : int
         cos(zenith) nodes per hemisphere.
+    basis : dict, optional
+        Parameters of the fit when they are not the daemonflux model
+        parameters themselves, e.g. a reduced hadronic basis (see
+        :py:func:`load_reduced_basis`). Keys: 'names' (list of str),
+        'values' (best-fit values, shape (n,)), 'cov' (covariance, shape
+        (n, n)) and 'transform' (shape (n_model, n), model parameters per unit
+        of each parameter, rows in daemonflux model order). The model
+        parameters are theta = transform @ (values + sigma * shifts). By
+        default every model parameter is a fit parameter with the sky
+        entry's calibration.
     """
 
-    def __init__(self, flux_obj, site, species_list, energy_grid, n_cz_half=401):
+    def __init__(self, flux_obj, site, species_list, energy_grid, n_cz_half=401,
+                 basis=None):
         from daemonflux.sky import _smoothstep
 
         sky = flux_obj._get_flux_instance(site)
         self.sky = sky
         model = sky._model
-        self.names = list(sky._params.known_parameters)
-        """Parameter order of `shifts` (daemonflux known_parameters)"""
-        self._index = np.array([model.names.index(n) for n in self.names])
         self._n_model = len(model.names)
-        self._base_values = np.array(sky._params.values, dtype=np.float64)
-        self._errors = np.array(sky._params.errors, dtype=np.float64)
-        self._invcov = np.linalg.inv(np.asarray(sky._params.cov, dtype=np.float64))
+        if basis is None:
+            # One fit parameter per model parameter, calibration of the sky entry
+            names = list(sky._params.known_parameters)
+            values = np.array(sky._params.values, dtype=np.float64)
+            cov = np.asarray(sky._params.cov, dtype=np.float64)
+            transform = np.zeros((self._n_model, len(names)))
+            for j, one_name in enumerate(names):
+                transform[model.names.index(one_name), j] = 1.0
+        else:
+            names = list(basis['names'])
+            values = np.asarray(basis['values'], dtype=np.float64)
+            cov = np.asarray(basis['cov'], dtype=np.float64)
+            transform = np.asarray(basis['transform'], dtype=np.float64)
+            if transform.shape != (self._n_model, len(names)):
+                raise ValueError('basis transform has shape %s, expected %s'
+                                 % (transform.shape, (self._n_model, len(names))))
+        self.names = names
+        """Parameter order of `shifts`"""
+        self._errors = np.sqrt(np.diag(cov))
+        self._invcov = np.linalg.inv(cov)
+        self._transform = transform
+        """Model parameters per unit of each fit parameter"""
+        self._theta_center = transform @ values
+        """Model parameters at the calibration (zero shifts)"""
         self._factor = np.array(model.factor, dtype=bool)
         self._log = np.array(model.log, dtype=bool)
 
@@ -787,8 +916,7 @@ class SkyGridFlux:
         ndarray
             Multipliers a(theta) in the daemonflux model order.
         """
-        theta = np.zeros(self._n_model)
-        theta[self._index] = self._base_values + self._errors * np.asarray(shifts, dtype=np.float64)
+        theta = self._theta_center + self._transform @ (self._errors * np.asarray(shifts, dtype=np.float64))
         return np.where(self._log, np.expm1(theta), theta)
 
     def chi2(self, shifts):
@@ -867,14 +995,13 @@ class SkyGridFlux:
         a : ndarray
             Model parameters (daemonflux model order), as `model_values`.
         da_dshift : ndarray
-            d a[_index[k]] / d shifts[k], in `names` order.
+            d a / d shifts, shape (n_model, n_params).
         """
-        theta = np.zeros(self._n_model)
-        theta[self._index] = self._base_values + self._errors * np.asarray(shifts, dtype=np.float64)
+        theta = self._theta_center + self._transform @ (self._errors * np.asarray(shifts, dtype=np.float64))
         a = np.where(self._log, np.expm1(theta), theta)
         # log parameters: a = exp(theta) - 1
         da_dtheta = np.where(self._log, np.exp(theta), 1.0)
-        return a, da_dtheta[self._index] * self._errors
+        return a, (da_dtheta[:, None] * self._transform) * self._errors[None, :]
 
     def grid_flux(self, species, shifts):
         """
@@ -970,7 +1097,7 @@ class SkyGridFlux:
                 d_table = self._factor_derivative(part, a, s_add, u, j)
                 grad_model[:, one_pos] += flat_weights @ d_table.ravel()
 
-        grad = grad_model[:, self._index] * da_dshift[None, :]
+        grad = grad_model @ da_dshift
         if single:
             return grad[0]
         return grad
@@ -1019,8 +1146,8 @@ class SkyGridFlux:
             jac[:, mask, :] += (blend[mask][None, :, None]
                                 * np.tensordot(weights, d_table, axes=(1, 0)))
 
-        jac = jac[:, :, self._index] * da_dshift[None, None, :]
-        return jac.reshape(n_cz * self.energy.size, -1)
+        jac = jac.reshape(n_cz * self.energy.size, self._n_model) @ da_dshift
+        return jac
 
     def event_matrix(self, true_energy, true_coszen):
         """
@@ -1255,7 +1382,9 @@ def _flux_gradient_check(service, random_state, n_params_checked=12, rtol=1e-6):
     checked = list(random_state.choice(len(shifts), size=min(n_params_checked, len(shifts)),
                                        replace=False))
     if service.bundle is not None:
-        for i, factor in enumerate(service.sky_grid._factor[service.sky_grid._index]):
+        sky_grid = service.sky_grid
+        for i in range(len(shifts)):
+            factor = np.any(sky_grid._transform[sky_grid._factor, i] != 0.)
             if factor and i not in checked:
                 checked.append(i)
     step = 1e-4
@@ -1332,3 +1461,74 @@ def test_flux_gradient():
     service.setup()
     _flux_gradient_check(service, random_state)
     logging.info('<< PASS : test_flux_gradient >>')
+
+
+def test_reduced_basis():
+    """
+    Reduced hadronic basis: the grid flux at random basis shifts equals the
+    default path (checked against daemonflux by :py:func:`test_sky_flux`) at
+    the same model parameters, and `flux_gradient` / `event_flux_jacobian`
+    agree with central differences.
+
+    Needs PISA_DAEMONFLUX_TEST_BUNDLE and PISA_DAEMONFLUX_TEST_CAL (a
+    full-rank calibration in the model parameters, see
+    :py:func:`test_sky_flux`), plus PISA_DAEMONFLUX_TEST_BASIS (basis JSON)
+    and PISA_DAEMONFLUX_TEST_BASIS_CAL (a fit in that basis). Skipped
+    otherwise.
+    """
+    import os
+
+    bundle = os.environ.get('PISA_DAEMONFLUX_TEST_BUNDLE')
+    cal_file = os.environ.get('PISA_DAEMONFLUX_TEST_CAL')
+    basis_file = os.environ.get('PISA_DAEMONFLUX_TEST_BASIS')
+    basis_cal = os.environ.get('PISA_DAEMONFLUX_TEST_BASIS_CAL')
+    if None in (bundle, cal_file, basis_file, basis_cal) or FTYPE != np.float64:
+        logging.info('<< SKIP : test_reduced_basis (needs the test bundle, calibrations and basis) >>')
+        return
+    site = os.environ.get('PISA_DAEMONFLUX_TEST_SITE', 'SouthPole')
+    random_state = get_random_state(random_state=7)
+    energy_grid = np.logspace(0., 4., 81)
+    species = ['numu', 'antinue']
+
+    # Same model parameters through both paths
+    full_grid = SkyGridFlux(Flux(bundle=bundle, cal_file=cal_file), site, species,
+                            energy_grid, n_cz_half=41)
+    basis_flux = Flux(bundle=bundle)
+    basis = load_reduced_basis(basis_file, basis_cal, basis_flux._get_flux_instance(site))
+    basis_grid = SkyGridFlux(basis_flux, site, species, energy_grid, n_cz_half=41,
+                             basis=basis)
+    assert np.all(np.sum(full_grid._transform, axis=1) <= 1.)
+    for i in range(3):
+        shifts = np.zeros(len(basis['names'])) if i == 0 else random_state.uniform(-2., 2., len(basis['names']))
+        theta = basis_grid._theta_center + basis_grid._transform @ (basis_grid._errors * shifts)
+        # default path: theta = center + errors * shifts_full (one model parameter each)
+        model_errors = full_grid._transform @ full_grid._errors
+        shifts_full = full_grid._transform.T @ ((theta - full_grid._theta_center) / model_errors)
+        for one_species in species:
+            assert np.allclose(basis_grid.grid_flux(one_species, shifts),
+                               full_grid.grid_flux(one_species, shifts_full),
+                               rtol=1e-12, atol=0.), f'reduced basis flux differs ({one_species})'
+        delta = np.sqrt(np.diag(basis['cov'])) * shifts
+        assert np.isclose(basis_grid.chi2(shifts), delta @ np.linalg.solve(basis['cov'], delta),
+                          rtol=1e-9)
+
+    # Gradients through the stage
+    param_set = ParamSet(*[
+        Param(name=pisa_param_name(n), value=random_state.uniform(-1.5, 1.5) * ureg.dimensionless,
+              prior=None, range=None, is_fixed=False)
+        for n in basis['names']
+    ])
+    service = daemon_flux(params=param_set, bundle=bundle, sky_site=site,
+                          calibration_file=basis_cal, reduced_basis=basis_file)
+    service.calc_mode = 'events'
+    containers = []
+    for name, nubar in [('numu_cc', 1), ('numubar_cc', -1)]:
+        container = Container(name)
+        container.set_aux_data('nubar', nubar)
+        container['true_energy'] = np.power(10., random_state.uniform(0.3, 3., 300)).astype(FTYPE)
+        container['true_coszen'] = random_state.uniform(-1., 1., 300).astype(FTYPE)
+        containers.append(container)
+    service.data = ContainerSet('data', containers)
+    service.setup()
+    _flux_gradient_check(service, random_state)
+    logging.info('<< PASS : test_reduced_basis >>')
